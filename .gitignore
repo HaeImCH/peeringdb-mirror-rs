@@ -1,0 +1,33 @@
+# Rust build artifacts
+target/
+
+# Node modules
+node_modules/
+
+# Wrangler local state
+.wrangler/
+.dev.vars
+wrangler.toml
+
+# Build output
+build/
+
+# Large database dumps (download separately)
+*.db
+peeringdb_dump*.sql
+
+# Generated D1 SQL files (run build_peeringdb_dump.py to generate)
+d1_sql/*.sql
+!d1_sql/00_schema.sql
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
