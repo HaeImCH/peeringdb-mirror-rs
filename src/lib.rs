@@ -361,3 +361,48 @@ fn json_response(data: Vec<Value>) -> Result<Response> {
 // Worker-build shim checks for this export; we provide a no-op to silence warnings.
 #[wasm_bindgen]
 pub fn set_panic_hook() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trims_trailing_newline_on_irr_as_set() {
+        let obj = json!({ "id": 1, "irr_as_set": "RADB::AS-FOO\n" });
+        let out = normalize_object(&obj);
+        assert_eq!(out["irr_as_set"], json!("RADB::AS-FOO"));
+    }
+
+    #[test]
+    fn trims_leading_and_trailing_whitespace() {
+        let obj = json!({ "irr_as_set": "  AS-BAR \t" });
+        let out = normalize_object(&obj);
+        assert_eq!(out["irr_as_set"], json!("AS-BAR"));
+    }
+
+    #[test]
+    fn leaves_clean_value_untouched() {
+        let obj = json!({ "irr_as_set": "RADB::AS-SIMPLE" });
+        let out = normalize_object(&obj);
+        assert_eq!(out["irr_as_set"], json!("RADB::AS-SIMPLE"));
+    }
+
+    #[test]
+    fn does_not_trim_free_text_fields() {
+        // notes/name/etc. are served verbatim by the official API; must not change.
+        let obj = json!({ "notes": "peer with us. ", "name": "ACME ", "irr_as_set": "AS-X " });
+        let out = normalize_object(&obj);
+        assert_eq!(out["notes"], json!("peer with us. "));
+        assert_eq!(out["name"], json!("ACME "));
+        assert_eq!(out["irr_as_set"], json!("AS-X"));
+    }
+
+    #[test]
+    fn ignores_non_string_and_missing_fields() {
+        let obj = json!({ "id": 1, "irr_as_set": null });
+        let out = normalize_object(&obj);
+        assert_eq!(out["irr_as_set"], json!(null));
+        let obj2 = json!({ "id": 2 });
+        assert_eq!(normalize_object(&obj2), obj2);
+    }
+}
