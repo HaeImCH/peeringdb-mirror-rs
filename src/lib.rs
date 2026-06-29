@@ -91,7 +91,10 @@ async fn get_by_id(ctx: RouteContext<()>) -> Result<Response> {
     let row = query.first::<PayloadRow>(None).await?;
 
     if let Some(row) = row {
-        let payload: Value = serde_json::from_str(&row.payload)?;
+        let mut payload: Value = serde_json::from_str(&row.payload)?;
+        // Normalize on read too, so rows ingested before the fix (or not yet
+        // re-synced) are still served clean to the client.
+        normalize_in_place(&mut payload);
         json_response(vec![payload])
     } else {
         json_response(Vec::new())
@@ -149,7 +152,12 @@ async fn query_resource(req: Request, ctx: RouteContext<()>) -> Result<Response>
     let rows: Vec<PayloadRow> = result.results()?;
     let payloads: Vec<Value> = rows
         .into_iter()
-        .map(|row| serde_json::from_str(&row.payload))
+        .map(|row| {
+            serde_json::from_str::<Value>(&row.payload).map(|mut v| {
+                normalize_in_place(&mut v);
+                v
+            })
+        })
         .collect::<std::result::Result<_, _>>()?;
 
     json_response(payloads)
@@ -266,8 +274,7 @@ async fn sync_since(
 // here so the mirror stays byte-faithful to the official API rather than the snapshot.
 const TRIM_STRING_FIELDS: &[&str] = &["irr_as_set"];
 
-fn normalize_object(obj: &Value) -> Value {
-    let mut obj = obj.clone();
+fn normalize_in_place(obj: &mut Value) {
     if let Some(map) = obj.as_object_mut() {
         for field in TRIM_STRING_FIELDS {
             if let Some(Value::String(s)) = map.get_mut(*field) {
@@ -278,6 +285,11 @@ fn normalize_object(obj: &Value) -> Value {
             }
         }
     }
+}
+
+fn normalize_object(obj: &Value) -> Value {
+    let mut obj = obj.clone();
+    normalize_in_place(&mut obj);
     obj
 }
 
@@ -361,3 +373,57 @@ fn json_response(data: Vec<Value>) -> Result<Response> {
 // Worker-build shim checks for this export; we provide a no-op to silence warnings.
 #[wasm_bindgen]
 pub fn set_panic_hook() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trims_trailing_newline_on_irr_as_set() {
+        let obj = json!({ "id": 1, "irr_as_set": "RADB::AS-FOO\n" });
+        let out = normalize_object(&obj);
+        assert_eq!(out["irr_as_set"], json!("RADB::AS-FOO"));
+    }
+
+    #[test]
+    fn trims_leading_and_trailing_whitespace() {
+        let obj = json!({ "irr_as_set": "  AS-BAR \t" });
+        let out = normalize_object(&obj);
+        assert_eq!(out["irr_as_set"], json!("AS-BAR"));
+    }
+
+    #[test]
+    fn leaves_clean_value_untouched() {
+        let obj = json!({ "irr_as_set": "RADB::AS-SIMPLE" });
+        let out = normalize_object(&obj);
+        assert_eq!(out["irr_as_set"], json!("RADB::AS-SIMPLE"));
+    }
+
+    #[test]
+    fn does_not_trim_free_text_fields() {
+        // notes/name/etc. are served verbatim by the official API; must not change.
+        let obj = json!({ "notes": "peer with us. ", "name": "ACME ", "irr_as_set": "AS-X " });
+        let out = normalize_object(&obj);
+        assert_eq!(out["notes"], json!("peer with us. "));
+        assert_eq!(out["name"], json!("ACME "));
+        assert_eq!(out["irr_as_set"], json!("AS-X"));
+    }
+
+    #[test]
+    fn in_place_trims_read_path_payload() {
+        // Mirrors the read path: a row stored dirty is cleaned before responding.
+        let mut payload: Value =
+            serde_json::from_str(r#"{"id":37749,"irr_as_set":"RADB::AS-SIMPLE\n"}"#).unwrap();
+        normalize_in_place(&mut payload);
+        assert_eq!(payload["irr_as_set"], json!("RADB::AS-SIMPLE"));
+    }
+
+    #[test]
+    fn ignores_non_string_and_missing_fields() {
+        let obj = json!({ "id": 1, "irr_as_set": null });
+        let out = normalize_object(&obj);
+        assert_eq!(out["irr_as_set"], json!(null));
+        let obj2 = json!({ "id": 2 });
+        assert_eq!(normalize_object(&obj2), obj2);
+    }
+}
