@@ -109,44 +109,23 @@ async fn query_resource(req: Request, ctx: RouteContext<()>) -> Result<Response>
         return Response::error("unknown resource", 400);
     }
     let url = req.url()?;
-
-    let mut id_filter: Option<i64> = None;
-    let mut since_filter: Option<i64> = None;
-    let mut limit: i64 = DEFAULT_QUERY_LIMIT;
-
-    for (key, value) in url.query_pairs() {
-        match key.as_ref() {
-            "id" => id_filter = value.parse().ok(),
-            "since" => since_filter = value.parse().ok(),
-            "limit" => limit = value.parse::<i64>().unwrap_or(limit),
-            _ => {}
-        }
-    }
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    let plan = build_query_plan(resource, &pairs);
 
     let db = ctx.env.d1("PEERINGDB")?;
-    let mut sql = String::from("SELECT payload FROM objects WHERE resource = ?1");
-    let mut bindings: Vec<JsValue> = vec![JsValue::from_str(&resource)];
+    let bindings: Vec<JsValue> = plan
+        .binds
+        .iter()
+        .map(|b| match b {
+            Bind::Num(n) => JsValue::from_f64(*n),
+            Bind::Text(s) => JsValue::from_str(s),
+        })
+        .collect();
 
-    if let Some(id) = id_filter {
-        let idx = bindings.len() + 1;
-        sql.push_str(&format!(" AND obj_id = ?{}", idx));
-        bindings.push(JsValue::from_f64(id as f64));
-    }
-
-    if let Some(since_ts) = since_filter {
-        let idx = bindings.len() + 1;
-        sql.push_str(&format!(
-            " AND datetime(updated) > datetime(?{}, 'unixepoch')",
-            idx
-        ));
-        bindings.push(JsValue::from_f64(since_ts as f64));
-    }
-
-    let idx = bindings.len() + 1;
-    sql.push_str(&format!(" ORDER BY obj_id LIMIT ?{}", idx));
-    bindings.push(JsValue::from_f64(limit.max(1) as f64));
-
-    let statement = db.prepare(&sql);
+    let statement = db.prepare(&plan.sql);
     let query = statement.bind(&bindings)?;
     let result = query.all().await?;
     let rows: Vec<PayloadRow> = result.results()?;
@@ -161,6 +140,113 @@ async fn query_resource(req: Request, ctx: RouteContext<()>) -> Result<Response>
         .collect::<std::result::Result<_, _>>()?;
 
     json_response(payloads)
+}
+
+/// A SQL bind value, kept independent of `JsValue` so query planning stays
+/// pure and unit-testable off-wasm.
+#[derive(Debug, PartialEq)]
+enum Bind {
+    Num(f64),
+    Text(String),
+}
+
+struct QueryPlan {
+    sql: String,
+    binds: Vec<Bind>,
+}
+
+/// Reserved query params that shape the response or are handled as dedicated
+/// columns — never as JSON field filters. `depth`/`fields`/`q` are
+/// PeeringDB response-shaping/search knobs the mirror doesn't model; we ignore
+/// them rather than mistaking them for field filters (which would wrongly
+/// return an empty set).
+fn is_reserved_param(key: &str) -> bool {
+    matches!(key, "id" | "since" | "limit" | "skip" | "depth" | "fields" | "q")
+}
+
+/// PeeringDB field names are lowercase snake_case alphanumerics (e.g. `asn`,
+/// `irr_as_set`, `info_prefixes4`). Restrict filter keys to that shape so the
+/// `$.<field>` JSON path we build is always well-formed; anything else is
+/// dropped. Operator-suffixed keys like `asn__in` pass this check and simply
+/// match nothing (empty result) rather than silently returning a full page.
+fn is_filterable_field(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    match bytes.next() {
+        Some(b) if b.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Build the list query from raw query-string pairs. PeeringDB's list
+/// endpoints support arbitrary field-equality filters (`?asn=44324`,
+/// `?info_never_via_route_servers=1`); we honor any such filter by extracting
+/// the field from the stored JSON payload. Unmatched filters yield an empty
+/// result — we never fall back to an unfiltered page, which would let a client
+/// (e.g. pathvector reading `data[0]`) mistake a wrong record for the right one.
+fn build_query_plan(resource: &str, pairs: &[(String, String)]) -> QueryPlan {
+    let mut id_filter: Option<i64> = None;
+    let mut since_filter: Option<i64> = None;
+    let mut skip: i64 = 0;
+    let mut limit: i64 = DEFAULT_QUERY_LIMIT;
+    let mut field_filters: Vec<(String, String)> = Vec::new();
+
+    for (key, value) in pairs {
+        match key.as_str() {
+            "id" => id_filter = value.parse().ok(),
+            "since" => since_filter = value.parse().ok(),
+            "limit" => limit = value.parse::<i64>().unwrap_or(limit),
+            "skip" => skip = value.parse::<i64>().unwrap_or(skip),
+            other if !is_reserved_param(other) && is_filterable_field(other) => {
+                field_filters.push((other.to_string(), value.clone()));
+            }
+            _ => {}
+        }
+    }
+
+    let mut sql = String::from("SELECT payload FROM objects WHERE resource = ?1");
+    let mut binds: Vec<Bind> = vec![Bind::Text(resource.to_string())];
+
+    if let Some(id) = id_filter {
+        let idx = binds.len() + 1;
+        sql.push_str(&format!(" AND obj_id = ?{}", idx));
+        binds.push(Bind::Num(id as f64));
+    }
+
+    if let Some(since_ts) = since_filter {
+        let idx = binds.len() + 1;
+        sql.push_str(&format!(
+            " AND datetime(updated) > datetime(?{}, 'unixepoch')",
+            idx
+        ));
+        binds.push(Bind::Num(since_ts as f64));
+    }
+
+    for (field, value) in &field_filters {
+        // Compare both sides as text so a JSON integer (e.g. asn 44324) matches
+        // its decimal string form; absent fields json_extract to NULL and drop
+        // the row. The path is a bound parameter — no SQL/JSON injection.
+        let path_idx = binds.len() + 1;
+        let val_idx = binds.len() + 2;
+        sql.push_str(&format!(
+            " AND CAST(json_extract(payload, ?{}) AS TEXT) = ?{}",
+            path_idx, val_idx
+        ));
+        binds.push(Bind::Text(format!("$.{}", field)));
+        binds.push(Bind::Text(value.clone()));
+    }
+
+    let limit_idx = binds.len() + 1;
+    sql.push_str(&format!(" ORDER BY obj_id LIMIT ?{}", limit_idx));
+    binds.push(Bind::Num(limit.max(1) as f64));
+
+    if skip > 0 {
+        let off_idx = binds.len() + 1;
+        sql.push_str(&format!(" OFFSET ?{}", off_idx));
+        binds.push(Bind::Num(skip as f64));
+    }
+
+    QueryPlan { sql, binds }
 }
 
 async fn run_sync(req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -425,5 +511,125 @@ mod tests {
         assert_eq!(out["irr_as_set"], json!(null));
         let obj2 = json!({ "id": 2 });
         assert_eq!(normalize_object(&obj2), obj2);
+    }
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn plan_without_params_lists_first_page() {
+        let plan = build_query_plan("net", &[]);
+        assert_eq!(
+            plan.sql,
+            "SELECT payload FROM objects WHERE resource = ?1 ORDER BY obj_id LIMIT ?2"
+        );
+        assert_eq!(
+            plan.binds,
+            vec![Bind::Text("net".into()), Bind::Num(DEFAULT_QUERY_LIMIT as f64)]
+        );
+    }
+
+    #[test]
+    fn plan_filters_by_arbitrary_field() {
+        // The bug fix: ?asn=44324 must actually filter, not return page 1.
+        let plan = build_query_plan("net", &pairs(&[("asn", "44324")]));
+        assert_eq!(
+            plan.sql,
+            "SELECT payload FROM objects WHERE resource = ?1 \
+             AND CAST(json_extract(payload, ?2) AS TEXT) = ?3 \
+             ORDER BY obj_id LIMIT ?4"
+        );
+        assert_eq!(
+            plan.binds,
+            vec![
+                Bind::Text("net".into()),
+                Bind::Text("$.asn".into()),
+                Bind::Text("44324".into()),
+                Bind::Num(DEFAULT_QUERY_LIMIT as f64),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_filters_boolean_field() {
+        let plan = build_query_plan("net", &pairs(&[("info_never_via_route_servers", "1")]));
+        assert!(plan
+            .sql
+            .contains("AND CAST(json_extract(payload, ?2) AS TEXT) = ?3"));
+        assert_eq!(plan.binds[1], Bind::Text("$.info_never_via_route_servers".into()));
+        assert_eq!(plan.binds[2], Bind::Text("1".into()));
+    }
+
+    #[test]
+    fn plan_combines_multiple_filters_in_order() {
+        let plan = build_query_plan("netixlan", &pairs(&[("asn", "44324"), ("ix_id", "26")]));
+        assert_eq!(
+            plan.sql,
+            "SELECT payload FROM objects WHERE resource = ?1 \
+             AND CAST(json_extract(payload, ?2) AS TEXT) = ?3 \
+             AND CAST(json_extract(payload, ?4) AS TEXT) = ?5 \
+             ORDER BY obj_id LIMIT ?6"
+        );
+        assert_eq!(plan.binds[1], Bind::Text("$.asn".into()));
+        assert_eq!(plan.binds[2], Bind::Text("44324".into()));
+        assert_eq!(plan.binds[3], Bind::Text("$.ix_id".into()));
+        assert_eq!(plan.binds[4], Bind::Text("26".into()));
+    }
+
+    #[test]
+    fn plan_keeps_id_as_primary_key_lookup() {
+        let plan = build_query_plan("net", &pairs(&[("id", "34997")]));
+        assert_eq!(
+            plan.sql,
+            "SELECT payload FROM objects WHERE resource = ?1 AND obj_id = ?2 ORDER BY obj_id LIMIT ?3"
+        );
+        assert_eq!(plan.binds[1], Bind::Num(34997.0));
+    }
+
+    #[test]
+    fn plan_ignores_response_shaping_params() {
+        // depth/fields/q must not become field filters (which would force an
+        // empty result), and must not survive as filters at all.
+        let plan = build_query_plan(
+            "net",
+            &pairs(&[("depth", "1"), ("fields", "asn,name"), ("q", "foo")]),
+        );
+        assert_eq!(
+            plan.sql,
+            "SELECT payload FROM objects WHERE resource = ?1 ORDER BY obj_id LIMIT ?2"
+        );
+    }
+
+    #[test]
+    fn plan_drops_malformed_field_keys() {
+        // Uppercase / punctuation keys can't form a valid JSON path; ignore them.
+        let plan = build_query_plan("net", &pairs(&[("ASN", "1"), ("a-b", "2")]));
+        assert_eq!(
+            plan.sql,
+            "SELECT payload FROM objects WHERE resource = ?1 ORDER BY obj_id LIMIT ?2"
+        );
+    }
+
+    #[test]
+    fn plan_supports_limit_and_skip() {
+        let plan = build_query_plan("net", &pairs(&[("limit", "5"), ("skip", "10")]));
+        assert_eq!(
+            plan.sql,
+            "SELECT payload FROM objects WHERE resource = ?1 ORDER BY obj_id LIMIT ?2 OFFSET ?3"
+        );
+        assert_eq!(plan.binds[1], Bind::Num(5.0));
+        assert_eq!(plan.binds[2], Bind::Num(10.0));
+    }
+
+    #[test]
+    fn plan_unsupported_operator_suffix_matches_nothing_not_page_one() {
+        // asn__in builds a $.asn__in path that no payload has -> empty result,
+        // which is the safe failure mode (never a misleading full page).
+        let plan = build_query_plan("net", &pairs(&[("asn__in", "1,2,3")]));
+        assert_eq!(plan.binds[1], Bind::Text("$.asn__in".into()));
     }
 }

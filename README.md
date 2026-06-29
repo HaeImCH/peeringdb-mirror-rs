@@ -4,7 +4,7 @@ Rust Cloudflare Worker that mirrors the public PeeringDB API using a D1 database
 
 ## What you get
 - `GET /api/:resource/:id` – mirror of single-object calls, e.g. `/api/ix/3352`.
-- `GET /api/:resource` – supports `?id=`, `?since=` (unix seconds), `?limit=` (default 250).
+- `GET /api/:resource` – supports `?id=`, `?since=` (unix seconds), `?limit=` (default 250), `?skip=` (offset), plus PeeringDB field-equality filters (e.g. `?asn=44324`, `?info_never_via_route_servers=1`). Field filters match against the stored JSON payload; an unmatched filter returns `{"data": []}` — the mirror never falls back to an unfiltered page.
 - `POST /admin/sync` – trigger sync (requires `SYNC_SECRET`); add `?resource=org` (etc.) to sync a single resource.
 - `GET /health` – simple health check returning "ok".
 - Scheduled sync every 3 hours via Cloudflare Cron (configure in `wrangler.toml`).
@@ -82,6 +82,10 @@ After import, the scheduled cron will keep data up to date via incremental syncs
 - Fetch changes since a unix timestamp:
   ```bash
   curl "https://<your-worker>/api/net?since=1704067200&limit=500"
+  ```
+- Filter by field (e.g. resolve a network by ASN, as `pathvector` does):
+  ```bash
+  curl "https://<your-worker>/api/net?asn=44324"
   ```
 - Trigger a manual refresh (if `SYNC_SECRET` set):
   ```bash
