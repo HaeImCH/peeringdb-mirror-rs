@@ -260,19 +260,41 @@ async fn sync_since(
     Ok(total)
 }
 
+// Whitespace-trimmed string fields, to match PeeringDB's live API which strips
+// leading/trailing whitespace on save. The bulk CDN snapshots can carry raw
+// operator-entered dirt (e.g. a trailing newline in `irr_as_set`); normalize it
+// here so the mirror stays byte-faithful to the official API rather than the snapshot.
+const TRIM_STRING_FIELDS: &[&str] = &["irr_as_set"];
+
+fn normalize_object(obj: &Value) -> Value {
+    let mut obj = obj.clone();
+    if let Some(map) = obj.as_object_mut() {
+        for field in TRIM_STRING_FIELDS {
+            if let Some(Value::String(s)) = map.get_mut(*field) {
+                let trimmed = s.trim();
+                if trimmed.len() != s.len() {
+                    *s = trimmed.to_string();
+                }
+            }
+        }
+    }
+    obj
+}
+
 async fn upsert_objects(db: &D1Database, resource: &str, objects: &[Value]) -> Result<usize> {
     let mut imported = 0usize;
     let mut batch: Vec<D1PreparedStatement> = Vec::with_capacity(BATCH_SIZE);
     for obj in objects {
-        let id = obj
+        let normalized = normalize_object(obj);
+        let id = normalized
             .get("id")
             .and_then(|v| v.as_i64())
             .ok_or_else(|| Error::RustError("object is missing id".into()))?;
-        let updated = obj
+        let updated = normalized
             .get("updated")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let payload = serde_json::to_string(obj)?;
+        let payload = serde_json::to_string(&normalized)?;
 
         let prepared = db
             .prepare("INSERT INTO objects (resource, obj_id, updated, payload) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(resource, obj_id) DO UPDATE SET updated = excluded.updated, payload = excluded.payload")

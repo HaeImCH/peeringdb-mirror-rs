@@ -27,10 +27,27 @@ RESOURCES = [
     "netixlan",
 ]
 
+# String fields trimmed to match PeeringDB's live API, which strips leading/
+# trailing whitespace on save. Bulk CDN snapshots can carry raw operator-entered
+# dirt (e.g. a trailing newline in irr_as_set); normalize so the mirror matches
+# the official API rather than the snapshot.
+TRIM_STRING_FIELDS = ("irr_as_set",)
+
 DB_PATH = "peeringdb_dump.db"
 SQL_PATH = "peeringdb_dump.sql"
 CDN_BASE = "https://public.peeringdb.com"
 D1_DIR = "d1_sql"
+
+
+def normalize_obj(obj: dict) -> dict:
+    """Trim whitespace the live PeeringDB API strips; mutates and returns obj."""
+    for field in TRIM_STRING_FIELDS:
+        value = obj.get(field)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped != value:
+                obj[field] = stripped
+    return obj
 
 
 def main() -> int:
@@ -64,7 +81,7 @@ CREATE INDEX IF NOT EXISTS objects_resource_updated_idx
                 res,
                 obj.get("id"),
                 obj.get("updated", ""),
-                json.dumps(obj, separators=(",", ":")),
+                json.dumps(normalize_obj(obj), separators=(",", ":")),
             )
             for obj in data
         ]
