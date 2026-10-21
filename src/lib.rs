@@ -25,6 +25,10 @@ const BATCH_SIZE: usize = 50;
 const SYNC_PAGE_SIZE: i64 = 1000;
 /// Tries per PeeringDB request when it answers 429 (throttled).
 const MAX_FETCH_ATTEMPTS: u32 = 5;
+/// Most rows one list response may carry. Bigger results overrun the Worker's
+/// memory/CPU limits (Cloudflare error 1102; ~1 KB `net` rows already fail
+/// between 10k and 15k), so they get a 400 asking the client to page instead.
+const MAX_RESPONSE_ROWS: usize = 5000;
 const USER_AGENT: &str = concat!(
     "peeringdb-mirror/",
     env!("CARGO_PKG_VERSION"),
@@ -164,6 +168,16 @@ async fn query_resource(req: Request, ctx: RouteContext<()>) -> Result<Response>
     let query = statement.bind(&bindings)?;
     let result = query.all().await?;
     let rows: Vec<PayloadRow> = result.results()?;
+    // The plan fetches one row past the cap, so this means "too many to serve".
+    if rows.len() > MAX_RESPONSE_ROWS {
+        return error_response(
+            400,
+            &format!(
+                "More than {} objects match; page with limit and skip (at most {} per request)",
+                MAX_RESPONSE_ROWS, MAX_RESPONSE_ROWS
+            ),
+        );
+    }
     let payloads: Vec<Value> = rows
         .into_iter()
         .map(|row| {
@@ -366,7 +380,8 @@ fn build_query_plan(
     let mut id_filter: Option<i64> = None;
     let mut since_filter: Option<i64> = None;
     let mut skip: i64 = 0;
-    // 0 = no limit: like upstream, every match is returned unless the client pages.
+    // 0 = no limit: like upstream, every match is returned unless the client
+    // pages — up to MAX_RESPONSE_ROWS, past which the request is refused.
     let mut limit: i64 = 0;
     let mut field_filters: Vec<(&str, &str)> = Vec::new();
 
@@ -428,14 +443,12 @@ fn build_query_plan(
         push_field_filter(&mut sql, &mut binds, field, op, value);
     }
 
-    sql.push_str(" ORDER BY obj_id");
-    // SQLite only accepts OFFSET after a LIMIT; -1 means none.
-    if limit > 0 {
-        let idx = push_bind(&mut binds, Bind::Num(limit as f64));
-        sql.push_str(&format!(" LIMIT ?{}", idx));
-    } else if skip > 0 {
-        sql.push_str(" LIMIT -1");
-    }
+    // Fetch at most one row past the cap: enough to tell an oversized result
+    // (refused by the caller) from one that fits, without loading all of it.
+    let cap = MAX_RESPONSE_ROWS as i64 + 1;
+    let limit = if limit > 0 { limit.min(cap) } else { cap };
+    let idx = push_bind(&mut binds, Bind::Num(limit as f64));
+    sql.push_str(&format!(" ORDER BY obj_id LIMIT ?{}", idx));
     if skip > 0 {
         let idx = push_bind(&mut binds, Bind::Num(skip as f64));
         sql.push_str(&format!(" OFFSET ?{}", idx));
@@ -795,22 +808,26 @@ mod tests {
             .collect()
     }
 
+    /// The LIMIT every plan without a smaller client limit carries.
+    const CAP: f64 = (MAX_RESPONSE_ROWS + 1) as f64;
+
     fn plan_for(resource: &str, items: &[(&str, &str)]) -> QueryPlan {
         build_query_plan(resource, &pairs(items)).expect("valid query")
     }
 
     #[test]
-    fn plan_without_params_returns_every_row() {
-        // No implicit row cap, like upstream: a silent 250 truncated e.g.
-        // netixlan?asn=6939 (335 sessions).
+    fn plan_without_params_fetches_one_past_the_cap() {
+        // No silent page size: the old 250 truncated e.g. netixlan?asn=6939
+        // (335 sessions). Fetching one row past the cap lets the handler
+        // refuse an oversized result instead of truncating it.
         let plan = plan_for("net", &[]);
         assert_eq!(
             plan.sql,
             "SELECT payload FROM objects WHERE resource = ?1 \
              AND json_extract(payload, '$.status') IS NOT 'deleted' \
-             ORDER BY obj_id"
+             ORDER BY obj_id LIMIT ?2"
         );
-        assert_eq!(plan.binds, vec![Bind::Text("net".into())]);
+        assert_eq!(plan.binds, vec![Bind::Text("net".into()), Bind::Num(CAP)]);
         assert!(!plan.by_id);
     }
 
@@ -824,7 +841,7 @@ mod tests {
              AND json_extract(payload, '$.status') IS NOT 'deleted' \
              AND (json_type(payload, ?2) = ?3 \
              OR CAST(json_extract(payload, ?4) AS TEXT) = ?5 COLLATE NOCASE) \
-             ORDER BY obj_id"
+             ORDER BY obj_id LIMIT ?6"
         );
         assert_eq!(
             plan.binds,
@@ -834,6 +851,7 @@ mod tests {
                 Bind::Text("".into()),
                 Bind::Text("$.asn".into()),
                 Bind::Text("44324".into()),
+                Bind::Num(CAP),
             ]
         );
     }
@@ -860,7 +878,7 @@ mod tests {
              OR CAST(json_extract(payload, ?4) AS TEXT) = ?5 COLLATE NOCASE) \
              AND (json_type(payload, ?6) = ?7 \
              OR CAST(json_extract(payload, ?8) AS TEXT) = ?9 COLLATE NOCASE) \
-             ORDER BY obj_id"
+             ORDER BY obj_id LIMIT ?10"
         );
         assert_eq!(plan.binds[4], Bind::Text("44324".into()));
         assert_eq!(plan.binds[5], Bind::Text("$.ix_id".into()));
@@ -874,7 +892,7 @@ mod tests {
             plan.sql,
             "SELECT payload FROM objects WHERE resource = ?1 AND obj_id = ?2 \
              AND json_extract(payload, '$.status') IS NOT 'deleted' \
-             ORDER BY obj_id"
+             ORDER BY obj_id LIMIT ?3"
         );
         assert_eq!(plan.binds[1], Bind::Num(34997.0));
         assert!(plan.by_id);
@@ -896,7 +914,7 @@ mod tests {
             plan.sql,
             "SELECT payload FROM objects WHERE resource = ?1 \
              AND datetime(updated) > datetime(?2, 'unixepoch') \
-             ORDER BY obj_id"
+             ORDER BY obj_id LIMIT ?3"
         );
     }
 
@@ -922,7 +940,7 @@ mod tests {
             plan.sql,
             "SELECT payload FROM objects WHERE resource = ?1 \
              AND json_extract(payload, '$.status') IS NOT 'deleted' \
-             ORDER BY obj_id"
+             ORDER BY obj_id LIMIT ?2"
         );
     }
 
@@ -934,7 +952,7 @@ mod tests {
             plan.sql,
             "SELECT payload FROM objects WHERE resource = ?1 \
              AND json_extract(payload, '$.status') IS NOT 'deleted' \
-             ORDER BY obj_id"
+             ORDER BY obj_id LIMIT ?2"
         );
     }
 
@@ -952,18 +970,26 @@ mod tests {
     }
 
     #[test]
-    fn plan_limit_zero_means_no_limit() {
+    fn plan_limit_zero_means_no_client_limit() {
+        // Upstream's "no limit"; the mirror still stops one past its cap.
         let plan = plan_for("net", &[("limit", "0")]);
-        assert!(plan.sql.ends_with("ORDER BY obj_id"));
-        assert_eq!(plan.binds.len(), 1);
+        assert!(plan.sql.ends_with("ORDER BY obj_id LIMIT ?2"));
+        assert_eq!(plan.binds[1], Bind::Num(CAP));
+    }
+
+    #[test]
+    fn plan_clamps_limits_above_the_cap() {
+        // limit=100000 on a big table must be refused, not loaded in full.
+        let plan = plan_for("netixlan", &[("limit", "100000")]);
+        assert_eq!(plan.binds[1], Bind::Num(CAP));
     }
 
     #[test]
     fn plan_skip_without_limit_pages_from_offset() {
-        // SQLite needs a LIMIT before OFFSET; -1 means unbounded.
         let plan = plan_for("net", &[("skip", "10")]);
-        assert!(plan.sql.ends_with("ORDER BY obj_id LIMIT -1 OFFSET ?2"));
-        assert_eq!(plan.binds[1], Bind::Num(10.0));
+        assert!(plan.sql.ends_with("ORDER BY obj_id LIMIT ?2 OFFSET ?3"));
+        assert_eq!(plan.binds[1], Bind::Num(CAP));
+        assert_eq!(plan.binds[2], Bind::Num(10.0));
     }
 
     #[test]

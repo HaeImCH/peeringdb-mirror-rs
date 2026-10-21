@@ -5,7 +5,7 @@ Rust Cloudflare Worker that mirrors the public PeeringDB API using a D1 database
 ## What you get
 - `GET /api/:resource/:id` – mirror of single-object calls, e.g. `/api/ix/3352`; 404 if the object doesn't exist or was deleted.
 - `GET /api/:resource` – supports `?id=`, `?since=` (unix seconds), `?limit=` and `?skip=` (offset), plus PeeringDB field filters: equality (`?asn=44324`, `?info_never_via_route_servers=true`; text compares case-insensitively) and the `__in`, `__lt`, `__lte`, `__gt`, `__gte`, `__contains` and `__startswith` operators (e.g. `?asn__in=6939,44324`, `?name__contains=hurricane`). Filters match against the stored JSON payload; an unknown field or operator returns `{"data": []}` — the mirror never falls back to an unfiltered page. As on the official API:
-  - every match is returned unless you pass `limit` (`limit=0` also means no limit);
+  - every match is returned unless you pass `limit` (`limit=0` also means no limit) — up to 5,000 objects per response; a larger result gets a 400 asking you to page with `limit`/`skip` (see below);
   - objects deleted upstream are hidden except in `?since=` results;
   - a malformed `since`, `limit` or `skip` gets a 400, and an `?id=` that is malformed or matches nothing gets a 404, each with `meta.error` set.
 - `POST /admin/sync` – trigger sync (requires `SYNC_SECRET`); add `?resource=org` (etc.) to sync a single resource (an unknown name gets a 400). Resources sync independently; if any fail, the response is a 500 listing them under `failed`, and the rest are still synced.
@@ -123,7 +123,7 @@ After import, the scheduled cron will keep data up to date via incremental syncs
 - `since` filtering uses SQLite `datetime(?,'unixepoch')` against the stored `updated` strings (ISO 8601).
 - Objects deleted upstream are kept with `status: "deleted"` (so `?since=` can report them) but hidden from all other reads.
 - Single-object responses don't include the nested `*_set` lists (e.g. `netixlan_set` on `/api/net/:id`) that the official API adds, and `depth`/`fields` are ignored.
-- Unfiltered requests for the largest resources (e.g. all of `/api/netixlan`) can exceed Worker CPU or memory limits; page with `limit`/`skip` or use the `public.peeringdb.com` snapshots for full dumps.
+- List responses are capped at 5,000 objects (`MAX_RESPONSE_ROWS`); this is where the official API differs. Larger results, such as all of `/api/net`, would exceed the Worker's memory/CPU limits (Cloudflare error 1102), so they get a 400 instead of being truncated. Page with `limit`/`skip`, or use the `public.peeringdb.com` snapshots for full dumps.
 - If you see `no such table: objects` or `no such table: sync_state`, run the migration step above to create the schema in your D1 database.
 - Build targets `workers-rs 0.7.x` and uses upstream `worker-build`/`wasm-bindgen 0.2.106` (no local patches).
 
