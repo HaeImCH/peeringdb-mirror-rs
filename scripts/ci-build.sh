@@ -29,6 +29,10 @@ compatibility_flags = ["nodejs_compat"]
 [triggers]
 crons = ["0 */3 * * *"] # run sync every 3 hours
 
+[observability.logs]
+enabled = true
+invocation_logs = true
+
 [[d1_databases]]
 binding = "PEERINGDB"
 database_name = "peeringdb-mirror"
