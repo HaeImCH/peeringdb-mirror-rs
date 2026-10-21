@@ -112,6 +112,10 @@ CREATE TABLE IF NOT EXISTS objects (
 );
 CREATE INDEX IF NOT EXISTS objects_resource_updated_idx
   ON objects (resource, updated DESC);
+CREATE TABLE IF NOT EXISTS sync_state (
+  resource TEXT PRIMARY KEY,
+  since    INTEGER NOT NULL
+);
 """
         )
     print(f"wrote schema file {schema_path}")
@@ -122,6 +126,10 @@ CREATE INDEX IF NOT EXISTS objects_resource_updated_idx
     for res in RESOURCES:
         outfile = os.path.join(D1_DIR, f"{res}.sql")
         with open(outfile, "w", encoding="utf-8") as f:
+            # Clear the sync watermark first and write it last: if the import
+            # stops partway, the worker finds no watermark and re-syncs this
+            # resource in full instead of trusting a partial table.
+            f.write(f"DELETE FROM sync_state WHERE resource = '{res}';\n")
             f.write(f"DELETE FROM objects WHERE resource = '{res}';\n")
             for row in cur.execute(
                 "SELECT obj_id, updated, payload FROM objects WHERE resource = ?",
@@ -131,6 +139,15 @@ CREATE INDEX IF NOT EXISTS objects_resource_updated_idx
                 payload_escaped = payload.replace("'", "''")
                 f.write(
                     f"INSERT OR REPLACE INTO objects (resource,obj_id,updated,payload) VALUES ('{res}',{obj_id},'{updated}','{payload_escaped}');\n"
+                )
+            # Same watermark the worker derives after a completed sync.
+            (since,) = cur.execute(
+                "SELECT CAST(strftime('%s', MAX(updated)) AS INTEGER) FROM objects WHERE resource = ?",
+                (res,),
+            ).fetchone()
+            if since is not None:
+                f.write(
+                    f"INSERT OR REPLACE INTO sync_state (resource,since) VALUES ('{res}',{since});\n"
                 )
         print(f"wrote chunk {outfile}")
     conn.close()

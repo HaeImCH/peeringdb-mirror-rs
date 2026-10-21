@@ -45,10 +45,33 @@ struct SyncReport {
     imported: usize,
 }
 
+#[derive(Serialize)]
+struct SyncFailure {
+    resource: String,
+    error: String,
+}
+
+#[derive(Serialize)]
+struct SyncSummary {
+    synced: Vec<SyncReport>,
+    failed: Vec<SyncFailure>,
+}
+
 #[derive(Deserialize)]
 struct TsRow {
     ts: Option<String>,
 }
+
+#[derive(Deserialize)]
+struct SinceRow {
+    since: i64,
+}
+
+/// SQL predicate hiding soft-deleted objects. `since` syncs from PeeringDB
+/// return rows with status "deleted"; we keep them so watermarks and `?since=`
+/// work, but the official API never serves them otherwise. `IS NOT` (rather
+/// than `!=`) keeps rows that have no status at all.
+const NOT_DELETED: &str = "json_extract(payload, '$.status') IS NOT 'deleted'";
 
 #[event(fetch, respond_with_errors)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -63,8 +86,10 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
 #[event(scheduled)]
 pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
-    if let Err(err) = sync_all(&env, RESOURCES).await {
-        console_error!("scheduled sync failed: {:?}", err);
+    let summary = sync_all(&env, RESOURCES).await;
+    if !summary.failed.is_empty() {
+        let failed: Vec<&str> = summary.failed.iter().map(|f| f.resource.as_str()).collect();
+        console_error!("scheduled sync failed for: {}", failed.join(", "));
     }
 }
 
@@ -83,7 +108,11 @@ async fn get_by_id(ctx: RouteContext<()>) -> Result<Response> {
         .map_err(|_| Error::RustError("id must be an integer".into()))?;
 
     let db = ctx.env.d1("PEERINGDB")?;
-    let statement = db.prepare("SELECT payload FROM objects WHERE resource = ?1 AND obj_id = ?2");
+    // A deleted object is answered exactly like a missing one.
+    let statement = db.prepare(&format!(
+        "SELECT payload FROM objects WHERE resource = ?1 AND obj_id = ?2 AND {}",
+        NOT_DELETED
+    ));
     let query = statement.bind(&[
         JsValue::from_str(&resource),
         JsValue::from_f64(id as f64),
@@ -220,6 +249,10 @@ fn build_query_plan(resource: &str, pairs: &[(String, String)]) -> QueryPlan {
             idx
         ));
         binds.push(Bind::Num(since_ts as f64));
+    } else {
+        // Like the official API: deleted objects only show up in `since`
+        // queries, so incremental consumers can propagate the deletion.
+        sql.push_str(&format!(" AND {}", NOT_DELETED));
     }
 
     for (field, value) in &field_filters {
@@ -278,21 +311,34 @@ async fn run_sync(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .map(|v| v.iter().map(|s| s.as_str()).collect())
         .unwrap_or_else(|| RESOURCES.to_vec());
 
-    let reports = sync_all(&ctx.env, &resources).await?;
-    Response::from_json(&json!({ "synced": reports }))
+    let summary = sync_all(&ctx.env, &resources).await;
+    let status = if summary.failed.is_empty() { 200 } else { 500 };
+    Ok(Response::from_json(&summary)?.with_status(status))
 }
 
-async fn sync_all(
-    env: &Env,
-    resources: &[&str],
-) -> Result<Vec<SyncReport>> {
-    let mut reports = Vec::new();
+/// Resources sync independently: a failure is logged and reported, and the
+/// rest still run, so one bad resource can't leave every later one stale.
+async fn sync_all(env: &Env, resources: &[&str]) -> SyncSummary {
+    let mut summary = SyncSummary {
+        synced: Vec::new(),
+        failed: Vec::new(),
+    };
     for resource in resources {
-        let report = sync_resource(env, resource).await?;
-        console_log!("synced {} objects for {}", report.imported, report.resource);
-        reports.push(report);
+        match sync_resource(env, resource).await {
+            Ok(report) => {
+                console_log!("synced {} objects for {}", report.imported, report.resource);
+                summary.synced.push(report);
+            }
+            Err(err) => {
+                console_error!("sync failed for {}: {:?}", resource, err);
+                summary.failed.push(SyncFailure {
+                    resource: resource.to_string(),
+                    error: err.to_string(),
+                });
+            }
+        }
     }
-    Ok(reports)
+    summary
 }
 
 async fn sync_resource(
@@ -300,13 +346,20 @@ async fn sync_resource(
     resource: &str,
 ) -> Result<SyncReport> {
     let db = env.d1("PEERINGDB")?;
-    let since = max_updated_epoch(&db, resource).await?;
+    let since = sync_watermark(&db, resource).await?;
 
-    // Prefer incremental when we have a previous max(updated); fall back to full snapshot.
+    // Incremental from the last completed sync; full snapshot when there is none.
     let imported = match since {
         Some(since_ts) => sync_since(&db, resource, since_ts).await?,
         None => sync_full(&db, resource).await?,
     };
+
+    // Advance the watermark only once the resource is fully in. Deriving it
+    // from MAX(updated) mid-import would strand snapshot rows not yet written,
+    // since the snapshot is ordered by id, not by updated.
+    if let Some(ts) = max_updated_epoch(&db, resource).await? {
+        set_sync_watermark(&db, resource, ts).await?;
+    }
 
     Ok(SyncReport {
         resource: resource.to_string(),
@@ -384,18 +437,22 @@ async fn upsert_objects(db: &D1Database, resource: &str, objects: &[Value]) -> R
     let mut batch: Vec<D1PreparedStatement> = Vec::with_capacity(BATCH_SIZE);
     for obj in objects {
         let normalized = normalize_object(obj);
-        let id = normalized
-            .get("id")
-            .and_then(|v| v.as_i64())
-            .ok_or_else(|| Error::RustError("object is missing id".into()))?;
+        // One malformed object shouldn't block the rest of the resource.
+        let Some(id) = normalized.get("id").and_then(|v| v.as_i64()) else {
+            console_warn!("skipping {} object without an integer id", resource);
+            continue;
+        };
         let updated = normalized
             .get("updated")
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let payload = serde_json::to_string(&normalized)?;
 
+        // Never replace a row with an older version: a full re-sync over data
+        // already advanced by `since` would otherwise roll it back to the
+        // snapshot. `updated` is fixed-format ISO 8601, so text order is time order.
         let prepared = db
-            .prepare("INSERT INTO objects (resource, obj_id, updated, payload) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(resource, obj_id) DO UPDATE SET updated = excluded.updated, payload = excluded.payload")
+            .prepare("INSERT INTO objects (resource, obj_id, updated, payload) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(resource, obj_id) DO UPDATE SET updated = excluded.updated, payload = excluded.payload WHERE excluded.updated >= objects.updated")
             .bind(&[
                 JsValue::from_str(resource),
                 JsValue::from_f64(id as f64),
@@ -423,6 +480,21 @@ async fn max_updated_epoch(db: &D1Database, resource: &str) -> Result<Option<i64
     let query = stmt.bind(&[JsValue::from_str(resource)])?;
     let row = query.first::<TsRow>(None).await?;
     Ok(row.and_then(|r| r.ts.and_then(|v| v.parse::<i64>().ok())))
+}
+
+async fn sync_watermark(db: &D1Database, resource: &str) -> Result<Option<i64>> {
+    let stmt = db.prepare("SELECT since FROM sync_state WHERE resource = ?1");
+    let query = stmt.bind(&[JsValue::from_str(resource)])?;
+    let row = query.first::<SinceRow>(None).await?;
+    Ok(row.map(|r| r.since))
+}
+
+async fn set_sync_watermark(db: &D1Database, resource: &str, since: i64) -> Result<()> {
+    db.prepare("INSERT INTO sync_state (resource, since) VALUES (?1, ?2) ON CONFLICT(resource) DO UPDATE SET since = excluded.since")
+        .bind(&[JsValue::from_str(resource), JsValue::from_f64(since as f64)])?
+        .run()
+        .await?;
+    Ok(())
 }
 
 async fn fetch_api(url: &str) -> Result<ApiResponse> {
@@ -525,7 +597,9 @@ mod tests {
         let plan = build_query_plan("net", &[]);
         assert_eq!(
             plan.sql,
-            "SELECT payload FROM objects WHERE resource = ?1 ORDER BY obj_id LIMIT ?2"
+            "SELECT payload FROM objects WHERE resource = ?1 \
+             AND json_extract(payload, '$.status') IS NOT 'deleted' \
+             ORDER BY obj_id LIMIT ?2"
         );
         assert_eq!(
             plan.binds,
@@ -540,6 +614,7 @@ mod tests {
         assert_eq!(
             plan.sql,
             "SELECT payload FROM objects WHERE resource = ?1 \
+             AND json_extract(payload, '$.status') IS NOT 'deleted' \
              AND CAST(json_extract(payload, ?2) AS TEXT) = ?3 \
              ORDER BY obj_id LIMIT ?4"
         );
@@ -570,6 +645,7 @@ mod tests {
         assert_eq!(
             plan.sql,
             "SELECT payload FROM objects WHERE resource = ?1 \
+             AND json_extract(payload, '$.status') IS NOT 'deleted' \
              AND CAST(json_extract(payload, ?2) AS TEXT) = ?3 \
              AND CAST(json_extract(payload, ?4) AS TEXT) = ?5 \
              ORDER BY obj_id LIMIT ?6"
@@ -585,9 +661,33 @@ mod tests {
         let plan = build_query_plan("net", &pairs(&[("id", "34997")]));
         assert_eq!(
             plan.sql,
-            "SELECT payload FROM objects WHERE resource = ?1 AND obj_id = ?2 ORDER BY obj_id LIMIT ?3"
+            "SELECT payload FROM objects WHERE resource = ?1 AND obj_id = ?2 \
+             AND json_extract(payload, '$.status') IS NOT 'deleted' \
+             ORDER BY obj_id LIMIT ?3"
         );
         assert_eq!(plan.binds[1], Bind::Num(34997.0));
+    }
+
+    #[test]
+    fn plan_since_includes_deleted_objects() {
+        // Upstream `since` returns deletions so consumers can propagate them.
+        let plan = build_query_plan("netixlan", &pairs(&[("since", "1700000000")]));
+        assert_eq!(
+            plan.sql,
+            "SELECT payload FROM objects WHERE resource = ?1 \
+             AND datetime(updated) > datetime(?2, 'unixepoch') \
+             ORDER BY obj_id LIMIT ?3"
+        );
+    }
+
+    #[test]
+    fn plan_status_deleted_filter_still_hides_deleted() {
+        // Upstream returns nothing for ?status=deleted on a plain list; both
+        // clauses apply, so the mirror does too.
+        let plan = build_query_plan("netixlan", &pairs(&[("status", "deleted")]));
+        assert!(plan.sql.contains(NOT_DELETED));
+        assert_eq!(plan.binds[1], Bind::Text("$.status".into()));
+        assert_eq!(plan.binds[2], Bind::Text("deleted".into()));
     }
 
     #[test]
@@ -600,7 +700,9 @@ mod tests {
         );
         assert_eq!(
             plan.sql,
-            "SELECT payload FROM objects WHERE resource = ?1 ORDER BY obj_id LIMIT ?2"
+            "SELECT payload FROM objects WHERE resource = ?1 \
+             AND json_extract(payload, '$.status') IS NOT 'deleted' \
+             ORDER BY obj_id LIMIT ?2"
         );
     }
 
@@ -610,7 +712,9 @@ mod tests {
         let plan = build_query_plan("net", &pairs(&[("ASN", "1"), ("a-b", "2")]));
         assert_eq!(
             plan.sql,
-            "SELECT payload FROM objects WHERE resource = ?1 ORDER BY obj_id LIMIT ?2"
+            "SELECT payload FROM objects WHERE resource = ?1 \
+             AND json_extract(payload, '$.status') IS NOT 'deleted' \
+             ORDER BY obj_id LIMIT ?2"
         );
     }
 
@@ -619,7 +723,9 @@ mod tests {
         let plan = build_query_plan("net", &pairs(&[("limit", "5"), ("skip", "10")]));
         assert_eq!(
             plan.sql,
-            "SELECT payload FROM objects WHERE resource = ?1 ORDER BY obj_id LIMIT ?2 OFFSET ?3"
+            "SELECT payload FROM objects WHERE resource = ?1 \
+             AND json_extract(payload, '$.status') IS NOT 'deleted' \
+             ORDER BY obj_id LIMIT ?2 OFFSET ?3"
         );
         assert_eq!(plan.binds[1], Bind::Num(5.0));
         assert_eq!(plan.binds[2], Bind::Num(10.0));

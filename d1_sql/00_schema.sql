@@ -8,3 +8,7 @@ CREATE TABLE IF NOT EXISTS objects (
 );
 CREATE INDEX IF NOT EXISTS objects_resource_updated_idx
   ON objects (resource, updated DESC);
+CREATE TABLE IF NOT EXISTS sync_state (
+  resource TEXT PRIMARY KEY,
+  since    INTEGER NOT NULL
+);
