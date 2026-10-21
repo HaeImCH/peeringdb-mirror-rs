@@ -3,9 +3,12 @@
 Rust Cloudflare Worker that mirrors the public PeeringDB API using a D1 database. It fetches the published JSON dumps from `public.peeringdb.com`, stores objects per resource/id, and serves endpoints compatible with `https://www.peeringdb.com/api/...` so callers can simply change the base URL.
 
 ## What you get
-- `GET /api/:resource/:id` – mirror of single-object calls, e.g. `/api/ix/3352`.
-- `GET /api/:resource` – supports `?id=`, `?since=` (unix seconds), `?limit=` (default 250), `?skip=` (offset), plus PeeringDB field-equality filters (e.g. `?asn=44324`, `?info_never_via_route_servers=1`). Field filters match against the stored JSON payload; an unmatched filter returns `{"data": []}` — the mirror never falls back to an unfiltered page. As on the official API, objects deleted upstream are hidden except in `?since=` results.
-- `POST /admin/sync` – trigger sync (requires `SYNC_SECRET`); add `?resource=org` (etc.) to sync a single resource. Resources sync independently; if any fail, the response is a 500 listing them under `failed`, and the rest are still synced.
+- `GET /api/:resource/:id` – mirror of single-object calls, e.g. `/api/ix/3352`; 404 if the object doesn't exist or was deleted.
+- `GET /api/:resource` – supports `?id=`, `?since=` (unix seconds), `?limit=` and `?skip=` (offset), plus PeeringDB field filters: equality (`?asn=44324`, `?info_never_via_route_servers=true`; text compares case-insensitively) and the `__in`, `__lt`, `__lte`, `__gt`, `__gte`, `__contains` and `__startswith` operators (e.g. `?asn__in=6939,44324`, `?name__contains=hurricane`). Filters match against the stored JSON payload; an unknown field or operator returns `{"data": []}` — the mirror never falls back to an unfiltered page. As on the official API:
+  - every match is returned unless you pass `limit` (`limit=0` also means no limit);
+  - objects deleted upstream are hidden except in `?since=` results;
+  - a malformed `since`, `limit` or `skip` gets a 400, and an `?id=` that is malformed or matches nothing gets a 404, each with `meta.error` set.
+- `POST /admin/sync` – trigger sync (requires `SYNC_SECRET`); add `?resource=org` (etc.) to sync a single resource (an unknown name gets a 400). Resources sync independently; if any fail, the response is a 500 listing them under `failed`, and the rest are still synced.
 - `GET /health` – simple health check returning "ok".
 - Scheduled sync every 3 hours via Cloudflare Cron (configure in `wrangler.toml`).
 - Incremental-only sync uses `since=` against `www.peeringdb.com/api`; first run falls back to the full snapshot.
@@ -119,6 +122,8 @@ After import, the scheduled cron will keep data up to date via incremental syncs
 - `poc` (point of contact) is omitted because it requires PeeringDB authentication; add it to `RESOURCES` in `src/lib.rs` if you have access.
 - `since` filtering uses SQLite `datetime(?,'unixepoch')` against the stored `updated` strings (ISO 8601).
 - Objects deleted upstream are kept with `status: "deleted"` (so `?since=` can report them) but hidden from all other reads.
+- Single-object responses don't include the nested `*_set` lists (e.g. `netixlan_set` on `/api/net/:id`) that the official API adds, and `depth`/`fields` are ignored.
+- Unfiltered requests for the largest resources (e.g. all of `/api/netixlan`) can exceed Worker CPU or memory limits; page with `limit`/`skip` or use the `public.peeringdb.com` snapshots for full dumps.
 - If you see `no such table: objects` or `no such table: sync_state`, run the migration step above to create the schema in your D1 database.
 - Build targets `workers-rs 0.7.x` and uses upstream `worker-build`/`wasm-bindgen 0.2.106` (no local patches).
 
