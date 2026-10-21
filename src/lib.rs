@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use js_sys::Date;
+use std::time::Duration;
 use serde_json::{json, Value};
 use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
 use worker::*;
@@ -23,6 +24,8 @@ const RESOURCES: &[&str] = &[
 const BATCH_SIZE: usize = 50;
 const DEFAULT_QUERY_LIMIT: i64 = 250;
 const SYNC_PAGE_SIZE: i64 = 1000;
+/// Tries per PeeringDB request when it answers 429 (throttled).
+const MAX_FETCH_ATTEMPTS: u32 = 5;
 const USER_AGENT: &str = concat!(
     "peeringdb-mirror/",
     env!("CARGO_PKG_VERSION"),
@@ -346,11 +349,13 @@ async fn sync_resource(
     resource: &str,
 ) -> Result<SyncReport> {
     let db = env.d1("PEERINGDB")?;
+    // Optional: a PeeringDB API key lifts the strict anonymous rate limits.
+    let api_key = env.secret("PEERINGDB_API_KEY").ok().map(|k| k.to_string());
     let since = sync_watermark(&db, resource).await?;
 
     // Incremental from the last completed sync; full snapshot when there is none.
     let imported = match since {
-        Some(since_ts) => sync_since(&db, resource, since_ts).await?,
+        Some(since_ts) => sync_since(&db, resource, since_ts, api_key.as_deref()).await?,
         None => sync_full(&db, resource).await?,
     };
 
@@ -369,7 +374,8 @@ async fn sync_resource(
 
 async fn sync_full(db: &D1Database, resource: &str) -> Result<usize> {
     let url = format!("{}/{}-0.json", PUBLIC_BASE, resource);
-    let parsed = fetch_api(&url).await?;
+    // The public snapshot CDN needs no API key.
+    let parsed = fetch_api(&url, None).await?;
     upsert_objects(db, resource, &parsed.data).await
 }
 
@@ -377,6 +383,7 @@ async fn sync_since(
     db: &D1Database,
     resource: &str,
     since_ts: i64,
+    api_key: Option<&str>,
 ) -> Result<usize> {
     let now_secs = (Date::now() / 1000.0) as i64;
     let effective_since = since_ts.min(now_secs);
@@ -390,7 +397,7 @@ async fn sync_since(
             "https://www.peeringdb.com/api/{}?since={}&limit={}&skip={}",
             resource, effective_since, limit, skip
         );
-        let parsed = fetch_api(&url).await?;
+        let parsed = fetch_api(&url, api_key).await?;
         if parsed.data.is_empty() {
             break;
         }
@@ -497,31 +504,56 @@ async fn set_sync_watermark(db: &D1Database, resource: &str, since: i64) -> Resu
     Ok(())
 }
 
-async fn fetch_api(url: &str) -> Result<ApiResponse> {
-    let mut init = RequestInit::new();
-    init.with_method(Method::Get);
-    let mut request = Request::new_with_init(url, &init)?;
+async fn fetch_api(url: &str, api_key: Option<&str>) -> Result<ApiResponse> {
+    let mut attempt = 1;
+    loop {
+        let mut init = RequestInit::new();
+        init.with_method(Method::Get);
+        let mut request = Request::new_with_init(url, &init)?;
 
-    {
-        let headers = request.headers_mut()?;
-        headers.set("Accept", "application/json")?;
-        headers.set("User-Agent", USER_AGENT)?;
+        {
+            let headers = request.headers_mut()?;
+            headers.set("Accept", "application/json")?;
+            headers.set("User-Agent", USER_AGENT)?;
+            if let Some(key) = api_key {
+                headers.set("Authorization", &format!("Api-Key {}", key))?;
+            }
+        }
+
+        let mut resp = Fetch::Request(request).send().await?;
+
+        let status = resp.status_code();
+        // PeeringDB throttles anonymous clients hard (and Workers share egress
+        // IPs), so wait out a 429 as told rather than failing the resource.
+        if status == 429 && attempt < MAX_FETCH_ATTEMPTS {
+            let wait = retry_delay_secs(resp.headers().get("Retry-After")?.as_deref());
+            console_warn!("throttled by {}; retry {} in {}s", url, attempt, wait);
+            Delay::from(Duration::from_secs(wait)).await;
+            attempt += 1;
+            continue;
+        }
+        if status >= 400 {
+            let body = resp.text().await.unwrap_or_else(|_| "<no-body>".into());
+            return Err(Error::RustError(format!(
+                "status {} from {} body_snip={}",
+                status,
+                url,
+                body.get(..200).unwrap_or(&body)
+            )));
+        }
+
+        return resp.json().await;
     }
+}
 
-    let mut resp = Fetch::Request(request).send().await?;
-
-    let status = resp.status_code();
-    if status >= 400 {
-        let body = resp.text().await.unwrap_or_else(|_| "<no-body>".into());
-        return Err(Error::RustError(format!(
-            "status {} from {} body_snip={}",
-            status,
-            url,
-            body.get(..200).unwrap_or(&body)
-        )));
-    }
-
-    resp.json().await
+/// Seconds to wait before retrying a throttled request: the server's
+/// Retry-After (delta-seconds) plus a second of slack, since it is rounded
+/// down; 2s when absent or unparseable; never more than 30s.
+fn retry_delay_secs(retry_after: Option<&str>) -> u64 {
+    let secs = retry_after
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(2);
+    (secs + 1).min(30)
 }
 
 fn json_response(data: Vec<Value>) -> Result<Response> {
@@ -583,6 +615,15 @@ mod tests {
         assert_eq!(out["irr_as_set"], json!(null));
         let obj2 = json!({ "id": 2 });
         assert_eq!(normalize_object(&obj2), obj2);
+    }
+
+    #[test]
+    fn retry_delay_follows_retry_after_with_slack() {
+        assert_eq!(retry_delay_secs(Some("2")), 3);
+        assert_eq!(retry_delay_secs(Some(" 0 ")), 1);
+        assert_eq!(retry_delay_secs(None), 3);
+        assert_eq!(retry_delay_secs(Some("Wed, 21 Oct 2026 07:28:00 GMT")), 3);
+        assert_eq!(retry_delay_secs(Some("600")), 30);
     }
 
     fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {

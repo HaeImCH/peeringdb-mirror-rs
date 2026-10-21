@@ -34,6 +34,10 @@ Rust Cloudflare Worker that mirrors the public PeeringDB API using a D1 database
    ```bash
    wrangler secret put SYNC_SECRET
    ```
+   Recommended: also add a PeeringDB API key (create one in your PeeringDB profile; read-only is enough). Anonymous API access is tightly rate-limited and Workers share outbound IPs, so without a key incremental syncs regularly get HTTP 429 — they are retried, but can still fail:
+   ```bash
+   wrangler secret put PEERINGDB_API_KEY
+   ```
 7) Run locally:
    ```bash
    wrangler dev
@@ -103,7 +107,7 @@ After import, the scheduled cron will keep data up to date via incremental syncs
 ## How sync works
 - Each resource has a watermark in the `sync_state` table, written only after that resource syncs completely.
 - Without a watermark, the sync pulls the full dataset from `https://public.peeringdb.com/{resource}-0.json` (see `FETCHING_FULL_DATABASE.md`). An interrupted full sync leaves no watermark, so the next run starts it over instead of skipping the rows it never wrote.
-- With a watermark, syncs fetch only changes since then using `https://www.peeringdb.com/api/{resource}?since=<unix>&limit=1000&skip=...`.
+- With a watermark, syncs fetch only changes since then using `https://www.peeringdb.com/api/{resource}?since=<unix>&limit=1000&skip=...`, authenticated with `PEERINGDB_API_KEY` when set. A throttled request (HTTP 429) is retried after the server's `Retry-After` delay, up to 5 attempts.
 - To force a full re-sync of a resource, delete its row: `wrangler d1 execute peeringdb-mirror --remote --command "DELETE FROM sync_state WHERE resource = 'netixlan'"`.
 - A resource whose full sync can't finish within Worker limits will retry it every run (and log the failure); bootstrap that resource with the dump import above instead.
 - A failure in one resource is logged and doesn't stop the others. The cron invocation itself still reports success, so alert on the `scheduled sync failed for:` error log line.
