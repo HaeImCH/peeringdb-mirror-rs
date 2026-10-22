@@ -1,11 +1,13 @@
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use js_sys::Date;
+use std::collections::HashSet;
 use std::time::Duration;
 use serde_json::{json, Value};
 use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
 use worker::*;
 
 const PUBLIC_BASE: &str = "https://public.peeringdb.com";
+const API_BASE: &str = "https://www.peeringdb.com/api";
 // Order matters: parents before children to satisfy FKs during initial full sync.
 const RESOURCES: &[&str] = &[
     "org",
@@ -29,6 +31,13 @@ const MAX_FETCH_ATTEMPTS: u32 = 5;
 /// memory/CPU limits (Cloudflare error 1102; ~1 KB `net` rows already fail
 /// between 10k and 15k), so they get a 400 asking the client to page instead.
 const MAX_RESPONSE_ROWS: usize = 5000;
+/// UTC hour whose scheduled run also reconciles deletions, so it runs once a day.
+const RECONCILE_HOUR_UTC: u64 = 0;
+/// Most missing rows one reconcile run looks up per resource (100 per
+/// request); the rest wait for the next day's run.
+const MAX_RECONCILE_CANDIDATES: usize = 1000;
+/// Ids per `id__in` lookup while reconciling; 100 keeps URLs around 650 bytes.
+const RECONCILE_LOOKUP_SIZE: usize = 100;
 const USER_AGENT: &str = concat!(
     "peeringdb-mirror/",
     env!("CARGO_PKG_VERSION"),
@@ -63,9 +72,49 @@ struct SyncSummary {
     failed: Vec<SyncFailure>,
 }
 
+#[derive(Serialize)]
+struct ReconcileReport {
+    resource: String,
+    /// Live here but absent from upstream's list.
+    missing: usize,
+    /// Of those, left for the next run (beyond MAX_RECONCILE_CANDIDATES).
+    deferred: usize,
+    /// Of the rest, deleted upstream: stored as deleted.
+    deleted: usize,
+    /// Of those, gone upstream entirely (purged): marked deleted.
+    purged: usize,
+    /// Of those, still there but unlisted upstream (e.g. pending): stored as is.
+    refreshed: usize,
+}
+
+#[derive(Serialize)]
+struct ReconcileSummary {
+    dry_run: bool,
+    reconciled: Vec<ReconcileReport>,
+    failed: Vec<SyncFailure>,
+}
+
+/// An unfiltered `?fields=id` list: just the ids, plus when upstream built it.
 #[derive(Deserialize)]
-struct TsRow {
-    ts: Option<String>,
+struct IdListing {
+    data: Vec<IdOnly>,
+    #[serde(default)]
+    meta: ListingMeta,
+}
+
+#[derive(Deserialize)]
+struct IdOnly {
+    id: i64,
+}
+
+#[derive(Deserialize, Default)]
+struct ListingMeta {
+    generated: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct ObjIdRow {
+    obj_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -86,17 +135,31 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .get_async("/api/:resource", |req, ctx| async move { query_resource(req, ctx).await })
         .get("/health", |_, _| Response::ok("ok"))
         .post_async("/admin/sync", |req, ctx| async move { run_sync(req, ctx).await })
+        .post_async("/admin/reconcile", |req, ctx| async move { run_reconcile(req, ctx).await })
         .run(req, env)
         .await
 }
 
 #[event(scheduled)]
-pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let summary = sync_all(&env, RESOURCES).await;
     if !summary.failed.is_empty() {
         let failed: Vec<&str> = summary.failed.iter().map(|f| f.resource.as_str()).collect();
         console_error!("scheduled sync failed for: {}", failed.join(", "));
     }
+
+    // Once a day, after the sync, so it only chases what `since` can't report.
+    if utc_hour(event.schedule()) == RECONCILE_HOUR_UTC {
+        let summary = reconcile_all(&env, RESOURCES, false).await;
+        if !summary.failed.is_empty() {
+            let failed: Vec<&str> = summary.failed.iter().map(|f| f.resource.as_str()).collect();
+            console_error!("scheduled reconcile failed for: {}", failed.join(", "));
+        }
+    }
+}
+
+fn utc_hour(epoch_ms: f64) -> u64 {
+    (epoch_ms / 3_600_000.0) as u64 % 24
 }
 
 async fn get_by_id(ctx: RouteContext<()>) -> Result<Response> {
@@ -461,30 +524,55 @@ fn build_query_plan(
     })
 }
 
-async fn run_sync(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+/// Whether an admin request carries `Authorization: Bearer <SYNC_SECRET>`.
+fn authorized(req: &Request, ctx: &RouteContext<()>) -> Result<bool> {
     let secret = ctx.secret("SYNC_SECRET")?;
     let expected = format!("Bearer {}", secret.to_string());
-    let authorized = matches!(req.headers().get("Authorization")?, Some(header) if header == expected);
-    if !authorized {
-        return Response::error("unauthorized", 401);
-    }
+    Ok(matches!(req.headers().get("Authorization")?, Some(header) if header == expected))
+}
 
+/// The resources an admin request names with `?resource=` (all without one),
+/// or None for an unknown name: that is an error, not a cue to process everything.
+fn requested_resources(req: &Request) -> Result<Option<Vec<&'static str>>> {
     let requested = req
         .url()?
         .query_pairs()
         .find(|(k, _)| k == "resource")
         .map(|(_, v)| v.into_owned());
+    Ok(match requested.as_deref() {
+        None => Some(RESOURCES.to_vec()),
+        Some(name) => RESOURCES.iter().find(|&&known| known == name).map(|&known| vec![known]),
+    })
+}
 
-    // An unknown ?resource= is an error, not a cue to sync everything.
-    let resources: Vec<&str> = match requested.as_deref() {
-        None => RESOURCES.to_vec(),
-        Some(name) => match RESOURCES.iter().find(|&&known| known == name) {
-            Some(&known) => vec![known],
-            None => return Response::error("unknown resource", 400),
-        },
+async fn run_sync(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    if !authorized(&req, &ctx)? {
+        return Response::error("unauthorized", 401);
+    }
+    let Some(resources) = requested_resources(&req)? else {
+        return Response::error("unknown resource", 400);
     };
 
     let summary = sync_all(&ctx.env, &resources).await;
+    let status = if summary.failed.is_empty() { 200 } else { 500 };
+    Ok(Response::from_json(&summary)?.with_status(status))
+}
+
+async fn run_reconcile(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    if !authorized(&req, &ctx)? {
+        return Response::error("unauthorized", 401);
+    }
+    let Some(resources) = requested_resources(&req)? else {
+        return Response::error("unknown resource", 400);
+    };
+    // Any spelling of dry_run other than an explicit "no" previews: a typo
+    // must not turn a preview into a real run against production data.
+    let dry_run = req
+        .url()?
+        .query_pairs()
+        .any(|(k, v)| k == "dry_run" && !matches!(v.as_ref(), "0" | "false" | "False"));
+
+    let summary = reconcile_all(&ctx.env, &resources, dry_run).await;
     let status = if summary.failed.is_empty() { 200 } else { 500 };
     Ok(Response::from_json(&summary)?.with_status(status))
 }
@@ -519,21 +607,21 @@ async fn sync_resource(
     resource: &str,
 ) -> Result<SyncReport> {
     let db = env.d1("PEERINGDB")?;
-    // Optional: a PeeringDB API key lifts the strict anonymous rate limits.
-    let api_key = env.secret("PEERINGDB_API_KEY").ok().map(|k| k.to_string());
+    let api_key = peeringdb_api_key(env);
     let since = sync_watermark(&db, resource).await?;
 
     // Incremental from the last completed sync; full snapshot when there is none.
-    let imported = match since {
+    let (imported, newest) = match since {
         Some(since_ts) => sync_since(&db, resource, since_ts, api_key.as_deref()).await?,
         None => sync_full(&db, resource).await?,
     };
 
-    // Advance the watermark only once the resource is fully in. Deriving it
-    // from MAX(updated) mid-import would strand snapshot rows not yet written,
-    // since the snapshot is ordered by id, not by updated.
-    if let Some(ts) = max_updated_epoch(&db, resource).await? {
-        set_sync_watermark(&db, resource, ts).await?;
+    // Advance the watermark only once the resource is fully in (the snapshot
+    // is ordered by id, not by updated), and only to the newest `updated`
+    // PeeringDB sent. The table's MAX(updated) could be a deletion check's
+    // timestamp, written meanwhile, past changes this sync never fetched.
+    if let Some(newest) = newest {
+        set_sync_watermark(&db, resource, &newest).await?;
     }
 
     Ok(SyncReport {
@@ -542,38 +630,48 @@ async fn sync_resource(
     })
 }
 
-async fn sync_full(db: &D1Database, resource: &str) -> Result<usize> {
-    let url = format!("{}/{}-0.json", PUBLIC_BASE, resource);
-    // The public snapshot CDN needs no API key.
-    let parsed = fetch_api(&url, None).await?;
-    upsert_objects(db, resource, &parsed.data).await
+/// Optional: a PeeringDB API key lifts the strict anonymous rate limits.
+fn peeringdb_api_key(env: &Env) -> Option<String> {
+    env.secret("PEERINGDB_API_KEY").ok().map(|k| k.to_string())
 }
 
+/// Imports the full snapshot; returns the count and the newest `updated` in it.
+async fn sync_full(db: &D1Database, resource: &str) -> Result<(usize, Option<String>)> {
+    let url = format!("{}/{}-0.json", PUBLIC_BASE, resource);
+    // The public snapshot CDN needs no API key.
+    let parsed: ApiResponse = fetch_api(&url, None).await?;
+    let imported = upsert_objects(db, resource, &parsed.data).await?;
+    Ok((imported, newest_updated(&parsed.data).map(str::to_string)))
+}
+
+/// Imports changes since `since_ts`; returns the count and the newest `updated` seen.
 async fn sync_since(
     db: &D1Database,
     resource: &str,
     since_ts: i64,
     api_key: Option<&str>,
-) -> Result<usize> {
+) -> Result<(usize, Option<String>)> {
     let now_secs = (Date::now() / 1000.0) as i64;
     let effective_since = since_ts.min(now_secs);
 
     let mut total = 0usize;
+    let mut newest: Option<String> = None;
     let mut skip = 0i64;
     let limit = SYNC_PAGE_SIZE;
 
     loop {
         let url = format!(
-            "https://www.peeringdb.com/api/{}?since={}&limit={}&skip={}",
-            resource, effective_since, limit, skip
+            "{}/{}?since={}&limit={}&skip={}",
+            API_BASE, resource, effective_since, limit, skip
         );
-        let parsed = fetch_api(&url, api_key).await?;
+        let parsed: ApiResponse = fetch_api(&url, api_key).await?;
         if parsed.data.is_empty() {
             break;
         }
 
         let imported = upsert_objects(db, resource, &parsed.data).await?;
         total += imported;
+        newest = newest.max(newest_updated(&parsed.data).map(str::to_string));
 
         if (parsed.data.len() as i64) < limit {
             break;
@@ -581,7 +679,207 @@ async fn sync_since(
         skip += limit;
     }
 
-    Ok(total)
+    Ok((total, newest))
+}
+
+/// The latest `updated` among objects; fixed-format ISO 8601, so text order is time order.
+fn newest_updated(objects: &[Value]) -> Option<&str> {
+    objects
+        .iter()
+        .filter_map(|obj| obj.get("updated").and_then(Value::as_str))
+        .max()
+}
+
+/// Like `sync_all`, one resource at a time, each failing on its own.
+async fn reconcile_all(env: &Env, resources: &[&str], dry_run: bool) -> ReconcileSummary {
+    let mut summary = ReconcileSummary {
+        dry_run,
+        reconciled: Vec::new(),
+        failed: Vec::new(),
+    };
+    for resource in resources {
+        match reconcile_resource(env, resource, dry_run).await {
+            Ok(report) => {
+                console_log!(
+                    "reconciled {}{}: {} missing upstream ({} deferred), {} deleted, {} purged, {} refreshed",
+                    report.resource,
+                    if dry_run { " (dry run)" } else { "" },
+                    report.missing,
+                    report.deferred,
+                    report.deleted,
+                    report.purged,
+                    report.refreshed
+                );
+                summary.reconciled.push(report);
+            }
+            Err(err) => {
+                console_error!("reconcile failed for {}: {:?}", resource, err);
+                summary.failed.push(SyncFailure {
+                    resource: resource.to_string(),
+                    error: err.to_string(),
+                });
+            }
+        }
+    }
+    summary
+}
+
+/// Catches the mirror up on objects upstream no longer lists. `since` syncs
+/// can't: they miss deletions older than the first watermark, and objects
+/// PeeringDB purges outright vanish from `since` results too.
+async fn reconcile_resource(env: &Env, resource: &str, dry_run: bool) -> Result<ReconcileReport> {
+    let db = env.d1("PEERINGDB")?;
+    let api_key = peeringdb_api_key(env);
+    let api_key = api_key.as_deref();
+
+    let started = Date::now();
+    let listing: IdListing = fetch_api(&format!("{}/{}?fields=id", API_BASE, resource), api_key).await?;
+    // Unfiltered lists are served from a cache built at `generated`; objects
+    // created after that are absent from it, so only older rows can be missing.
+    let cutoff = iso_timestamp(listing.meta.generated.map_or(started, |secs| secs * 1000.0));
+    let upstream: HashSet<i64> = listing.data.iter().map(|o| o.id).collect();
+
+    let live: Vec<i64> = db
+        .prepare(&format!(
+            "SELECT obj_id FROM objects WHERE resource = ?1 AND updated < ?2 AND {} ORDER BY obj_id",
+            NOT_DELETED
+        ))
+        .bind(&[JsValue::from_str(resource), JsValue::from_str(&cutoff)])?
+        .all()
+        .await?
+        .results::<ObjIdRow>()?
+        .into_iter()
+        .map(|row| row.obj_id)
+        .collect();
+    let (candidates, deferred) = reconcile_candidates(&live, &upstream)?;
+
+    // Look everything up before writing anything, so the writes below land
+    // together under one fresh timestamp.
+    let canary = listing.data.first().map(|o| o.id);
+    let mut found: Vec<Value> = Vec::new();
+    for chunk in candidates.chunks(RECONCILE_LOOKUP_SIZE) {
+        let canary = canary.ok_or_else(|| Error::RustError("upstream listed nothing".into()))?;
+        found.extend(lookup_ids(resource, chunk, canary, api_key).await?);
+    }
+    let found_ids: HashSet<i64> = found
+        .iter()
+        .filter_map(|obj| obj.get("id").and_then(Value::as_i64))
+        .collect();
+    let purged: Vec<i64> = candidates
+        .iter()
+        .copied()
+        .filter(|id| !found_ids.contains(id))
+        .collect();
+
+    // Deletions found here get the time of the check, not upstream's own
+    // `updated`: that predates what `?since=` clients have already seen.
+    let checked_at = iso_timestamp(Date::now());
+    let mut report = ReconcileReport {
+        resource: resource.to_string(),
+        missing: candidates.len() + deferred,
+        deferred,
+        deleted: 0,
+        purged: purged.len(),
+        refreshed: 0,
+    };
+    for obj in &mut found {
+        if obj.get("status").and_then(Value::as_str) == Some("deleted") {
+            obj["updated"] = Value::from(checked_at.as_str());
+            report.deleted += 1;
+        } else {
+            report.refreshed += 1;
+        }
+    }
+    if !dry_run {
+        upsert_objects(&db, resource, &found).await?;
+        report.purged = mark_purged(&db, resource, &purged, &checked_at).await?;
+    }
+    Ok(report)
+}
+
+/// Mirror ids absent from upstream's id list: the first MAX_RECONCILE_CANDIDATES,
+/// plus how many more wait for the next run. Refuses a listing under half the
+/// mirror's size, since an empty or truncated one says nothing about deletions.
+fn reconcile_candidates(live: &[i64], upstream: &HashSet<i64>) -> Result<(Vec<i64>, usize)> {
+    if upstream.len() * 2 < live.len() {
+        return Err(Error::RustError(format!(
+            "refusing to reconcile: upstream lists {} objects, the mirror has {}",
+            upstream.len(),
+            live.len()
+        )));
+    }
+    let mut missing: Vec<i64> = live
+        .iter()
+        .copied()
+        .filter(|id| !upstream.contains(id))
+        .collect();
+    let deferred = missing.len().saturating_sub(MAX_RECONCILE_CANDIDATES);
+    missing.truncate(MAX_RECONCILE_CANDIDATES);
+    Ok((missing, deferred))
+}
+
+/// Looks ids up with `since=1`, which, unlike lists, also returns deleted and
+/// pending objects; whatever doesn't come back, PeeringDB no longer has. The
+/// lookup also asks for `canary`, an id upstream just listed: an answer
+/// without it is broken and must not read as every other id being gone.
+async fn lookup_ids(
+    resource: &str,
+    ids: &[i64],
+    canary: i64,
+    api_key: Option<&str>,
+) -> Result<Vec<Value>> {
+    let query: Vec<String> = ids.iter().chain([&canary]).map(i64::to_string).collect();
+    let url = format!("{}/{}?id__in={}&since=1", API_BASE, resource, query.join(","));
+    let mut found: ApiResponse = fetch_api(&url, api_key).await?;
+    let returned = found.data.len();
+    found
+        .data
+        .retain(|obj| obj.get("id").and_then(Value::as_i64) != Some(canary));
+    if found.data.len() == returned {
+        return Err(Error::RustError(format!(
+            "lookup left out listed {} {}; not trusting it",
+            resource, canary
+        )));
+    }
+    Ok(found.data)
+}
+
+/// Marks objects PeeringDB no longer has at all as deleted as of `checked_at`.
+async fn mark_purged(
+    db: &D1Database,
+    resource: &str,
+    ids: &[i64],
+    checked_at: &str,
+) -> Result<usize> {
+    let sql = format!(
+        "UPDATE objects SET updated = ?3, \
+         payload = json_set(payload, '$.status', 'deleted', '$.updated', ?3) \
+         WHERE resource = ?1 AND obj_id = ?2 AND {}",
+        NOT_DELETED
+    );
+    let mut purged = 0usize;
+    for chunk in ids.chunks(BATCH_SIZE) {
+        let statements = chunk
+            .iter()
+            .map(|&id| {
+                db.prepare(&sql).bind(&[
+                    JsValue::from_str(resource),
+                    JsValue::from_f64(id as f64),
+                    JsValue::from_str(checked_at),
+                ])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for result in db.batch(statements).await? {
+            purged += result.meta()?.and_then(|meta| meta.changes).unwrap_or(0);
+        }
+    }
+    Ok(purged)
+}
+
+/// Epoch milliseconds as PeeringDB writes `updated`: `YYYY-MM-DDTHH:MM:SSZ`.
+fn iso_timestamp(epoch_ms: f64) -> String {
+    let iso = String::from(Date::new(&JsValue::from_f64(epoch_ms)).to_iso_string()); // ...T06:01:35.123Z
+    format!("{}Z", &iso[..19])
 }
 
 // Whitespace-trimmed string fields, to match PeeringDB's live API which strips
@@ -652,13 +950,6 @@ async fn upsert_objects(db: &D1Database, resource: &str, objects: &[Value]) -> R
     Ok(imported)
 }
 
-async fn max_updated_epoch(db: &D1Database, resource: &str) -> Result<Option<i64>> {
-    let stmt = db.prepare("SELECT strftime('%s', MAX(updated)) as ts FROM objects WHERE resource = ?1");
-    let query = stmt.bind(&[JsValue::from_str(resource)])?;
-    let row = query.first::<TsRow>(None).await?;
-    Ok(row.and_then(|r| r.ts.and_then(|v| v.parse::<i64>().ok())))
-}
-
 async fn sync_watermark(db: &D1Database, resource: &str) -> Result<Option<i64>> {
     let stmt = db.prepare("SELECT since FROM sync_state WHERE resource = ?1");
     let query = stmt.bind(&[JsValue::from_str(resource)])?;
@@ -666,15 +957,17 @@ async fn sync_watermark(db: &D1Database, resource: &str) -> Result<Option<i64>> 
     Ok(row.map(|r| r.since))
 }
 
-async fn set_sync_watermark(db: &D1Database, resource: &str, since: i64) -> Result<()> {
-    db.prepare("INSERT INTO sync_state (resource, since) VALUES (?1, ?2) ON CONFLICT(resource) DO UPDATE SET since = excluded.since")
-        .bind(&[JsValue::from_str(resource), JsValue::from_f64(since as f64)])?
+/// Stores an `updated` timestamp as the resource's watermark, in unix seconds;
+/// one SQLite can't parse is skipped rather than stored.
+async fn set_sync_watermark(db: &D1Database, resource: &str, updated: &str) -> Result<()> {
+    db.prepare("INSERT INTO sync_state (resource, since) SELECT ?1, CAST(strftime('%s', ?2) AS INTEGER) WHERE strftime('%s', ?2) IS NOT NULL ON CONFLICT(resource) DO UPDATE SET since = excluded.since")
+        .bind(&[JsValue::from_str(resource), JsValue::from_str(updated)])?
         .run()
         .await?;
     Ok(())
 }
 
-async fn fetch_api(url: &str, api_key: Option<&str>) -> Result<ApiResponse> {
+async fn fetch_api<T: DeserializeOwned>(url: &str, api_key: Option<&str>) -> Result<T> {
     let mut attempt = 1;
     loop {
         let mut init = RequestInit::new();
@@ -799,6 +1092,52 @@ mod tests {
         assert_eq!(retry_delay_secs(None), 3);
         assert_eq!(retry_delay_secs(Some("Wed, 21 Oct 2026 07:28:00 GMT")), 3);
         assert_eq!(retry_delay_secs(Some("600")), 30);
+    }
+
+    #[test]
+    fn reconcile_runs_in_the_midnight_utc_cron() {
+        assert_eq!(utc_hour(1_792_627_200_000.0), 0); // 2026-10-22T00:00:00Z
+        assert_eq!(utc_hour(1_792_638_000_000.0), 3); // 2026-10-22T03:00:00Z
+        assert_eq!(utc_hour(1_792_710_000_000.0), 23); // 2026-10-22T23:00:00Z
+    }
+
+    #[test]
+    fn reconcile_candidates_are_live_rows_upstream_no_longer_lists() {
+        let upstream: HashSet<i64> = [1, 2, 4, 9].into_iter().collect();
+        let (missing, deferred) = reconcile_candidates(&[1, 2, 3, 4, 5], &upstream).expect("small gap");
+        assert_eq!((missing, deferred), (vec![3, 5], 0));
+    }
+
+    #[test]
+    fn reconcile_defers_candidates_beyond_one_runs_share() {
+        let live: Vec<i64> = (0..10_000).collect();
+        let upstream: HashSet<i64> = (0..8_000).collect();
+        let (missing, deferred) = reconcile_candidates(&live, &upstream).expect("plausible gap");
+        assert_eq!(missing.len(), MAX_RECONCILE_CANDIDATES);
+        assert_eq!(missing[0], 8_000);
+        assert_eq!(deferred, 2_000 - MAX_RECONCILE_CANDIDATES);
+    }
+
+    #[test]
+    fn reconcile_refuses_an_implausible_listing() {
+        // Empty or truncated upstream listing.
+        assert!(reconcile_candidates(&[1, 2, 3], &HashSet::new()).is_err());
+        let upstream: HashSet<i64> = (0..10).collect();
+        assert!(reconcile_candidates(&(0..21).collect::<Vec<_>>(), &upstream).is_err());
+        // An empty mirror has nothing to reconcile.
+        assert_eq!(reconcile_candidates(&[], &HashSet::new()).unwrap(), (vec![], 0));
+    }
+
+    #[test]
+    fn watermark_follows_the_newest_upstream_update() {
+        let objects = vec![
+            json!({ "id": 1, "updated": "2026-10-21T23:59:59Z" }),
+            json!({ "id": 2, "updated": "2026-10-22T03:01:34Z" }),
+            json!({ "id": 3 }),
+            json!({ "id": 4, "updated": "2025-12-31T00:00:00Z" }),
+        ];
+        assert_eq!(newest_updated(&objects), Some("2026-10-22T03:01:34Z"));
+        assert_eq!(newest_updated(&[]), None);
     }
 
     fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {

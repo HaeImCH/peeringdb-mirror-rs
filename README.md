@@ -9,8 +9,9 @@ Rust Cloudflare Worker that mirrors the public PeeringDB API using a D1 database
   - objects deleted upstream are hidden except in `?since=` results;
   - a malformed `since`, `limit` or `skip` gets a 400, and an `?id=` that is malformed or matches nothing gets a 404, each with `meta.error` set.
 - `POST /admin/sync` – trigger sync (requires `SYNC_SECRET`); add `?resource=org` (etc.) to sync a single resource (an unknown name gets a 400). Resources sync independently; if any fail, the response is a 500 listing them under `failed`, and the rest are still synced.
+- `POST /admin/reconcile` – run the deletion check below now (same `SYNC_SECRET` and `?resource=` as `/admin/sync`); add `?dry_run=1` to report what it would change without writing anything (any `dry_run` value except `0`/`false` counts as a dry run).
 - `GET /health` – simple health check returning "ok".
-- Scheduled sync every 3 hours via Cloudflare Cron (configure in `wrangler.toml`).
+- Scheduled sync every 3 hours via Cloudflare Cron (configure in `wrangler.toml`); the run in the 00:00 UTC hour also runs the deletion check.
 - Incremental-only sync uses `since=` against `www.peeringdb.com/api`; first run falls back to the full snapshot.
 - Data stored raw as JSON for fidelity; schema defined in `migrations/`.
 - Supported resources: `org`, `campus`, `fac`, `net`, `ix`, `carrier`, `carrierfac`, `ixfac`, `ixlan`, `ixpfx`, `netfac`, `netixlan`.
@@ -108,9 +109,24 @@ After import, the scheduled cron will keep data up to date via incremental syncs
   ```
 
 ## How sync works
-- Each resource has a watermark in the `sync_state` table, written only after that resource syncs completely.
+- Each resource has a watermark in the `sync_state` table: the newest `updated` PeeringDB sent, written only after that resource syncs completely.
 - Without a watermark, the sync pulls the full dataset from `https://public.peeringdb.com/{resource}-0.json` (see `FETCHING_FULL_DATABASE.md`). An interrupted full sync leaves no watermark, so the next run starts it over instead of skipping the rows it never wrote.
 - With a watermark, syncs fetch only changes since then using `https://www.peeringdb.com/api/{resource}?since=<unix>&limit=1000&skip=...`, authenticated with `PEERINGDB_API_KEY` when set. A throttled request (HTTP 429) is retried after the server's `Retry-After` delay, up to 5 attempts.
+- Once a day, after the 00:00 UTC sync, a deletion check catches what `since` can't report: deletions older than the first watermark, and objects PeeringDB purged outright (those vanish from `since` results too). For each resource it:
+  1. fetches upstream's id list (`?fields=id`) and takes the mirror's live rows missing from it, skipping rows updated after the list was generated (unfiltered lists are served from a cache);
+  2. looks each one up with `?id__in=...&since=1`, which, unlike lists, also returns deleted and `pending` objects, and stores what upstream returns;
+  3. marks the rest — purged, gone upstream entirely — `deleted`.
+
+  Deletions it finds (steps 2 and 3) get `updated` set to the time of the check, not upstream's original deletion time, so `?since=` clients learn about them. Its report counts `deleted`, `purged`, `refreshed` (still there upstream but unlisted, such as `pending` campuses, which show up every day) and `deferred`.
+
+  Safeguards, since a broken upstream answer must not read as mass deletion:
+  - a resource whose upstream list holds fewer than half as many objects as the mirror is skipped;
+  - every lookup also asks for one object upstream just listed, and a lookup that leaves it out fails the resource;
+  - at most 1,000 missing rows (`MAX_RECONCILE_CANDIDATES`) are looked up per resource per run; the rest are `deferred` to the next day.
+
+  Failures are logged as `scheduled reconcile failed for:`. With a cron that never fires in the 00:00 UTC hour, the check never runs on its own; use `/admin/reconcile`.
+
+  To restore a row the check wrongly marked deleted, delete the row and force a full re-sync of its resource (below). A full re-sync alone won't do it: the snapshot copy is older than the check's timestamp, and rows are never replaced by older versions.
 - To force a full re-sync of a resource, delete its row: `wrangler d1 execute peeringdb-mirror --remote --command "DELETE FROM sync_state WHERE resource = 'netixlan'"`.
 - A resource whose full sync can't finish within Worker limits will retry it every run (and log the failure); bootstrap that resource with the dump import above instead.
 - A failure in one resource is logged and doesn't stop the others. The cron invocation itself still reports success, so alert on the `scheduled sync failed for:` error log line.
