@@ -31,3 +31,6 @@ __pycache__/
 .idea/
 .vscode/
 *.swp
+
+# Golden-response snapshots (scripts/golden.sh)
+tasks/golden/
