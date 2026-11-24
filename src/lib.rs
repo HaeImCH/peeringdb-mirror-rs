@@ -38,6 +38,11 @@ const RECONCILE_HOUR_UTC: u64 = 0;
 const MAX_RECONCILE_CANDIDATES: usize = 1000;
 /// Ids per `id__in` lookup while reconciling; 100 keeps URLs around 650 bytes.
 const RECONCILE_LOOKUP_SIZE: usize = 100;
+/// Interval of the sync cron (`0 */3 * * *` in wrangler.toml); the data only
+/// changes on these ticks, which fall on multiples of it since the epoch.
+const SYNC_INTERVAL_SECS: i64 = 3 * 3600;
+/// Time a sync gets to finish after its tick before cached responses expire.
+const SYNC_SETTLE_SECS: i64 = 600;
 const USER_AGENT: &str = concat!(
     "peeringdb-mirror/",
     env!("CARGO_PKG_VERSION"),
@@ -129,7 +134,58 @@ struct SinceRow {
 const NOT_DELETED: &str = "json_extract(payload, '$.status') IS NOT 'deleted'";
 
 #[event(fetch, respond_with_errors)]
-pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    // Reads are answered from the edge cache where possible: the data only
+    // changes on sync ticks, and clients like pathvector repeat the same
+    // lookups every run, each costing D1 a scan otherwise.
+    let cache_key = cache_key(&req)?;
+    if let Some(key) = &cache_key {
+        match Cache::default().get(key.as_str(), false).await {
+            Ok(Some(hit)) => return Ok(hit),
+            Ok(None) => {}
+            Err(err) => console_warn!("cache lookup failed for {}: {:?}", key, err),
+        }
+    }
+
+    let mut resp = route(req, env).await?;
+
+    if let Some(key) = cache_key {
+        if resp.status_code() == 200 {
+            let max_age = cache_ttl_secs(Date::now());
+            resp.headers_mut()
+                .set("Cache-Control", &format!("public, max-age={}", max_age))?;
+            resp.headers_mut().set("X-Mirror-Cache", "miss")?;
+            let mut copy = resp.cloned()?;
+            copy.headers_mut().set("X-Mirror-Cache", "hit")?;
+            ctx.wait_until(async move {
+                if let Err(err) = Cache::default().put(key.as_str(), copy).await {
+                    console_warn!("cache store failed for {}: {:?}", key, err);
+                }
+            });
+        }
+    }
+    Ok(resp)
+}
+
+/// The cache key for a request whose response may be cached: the full URL of
+/// a `GET /api/...` read. Admin and health endpoints never are.
+fn cache_key(req: &Request) -> Result<Option<String>> {
+    if req.method() != Method::Get {
+        return Ok(None);
+    }
+    let url = req.url()?;
+    Ok(url.path().starts_with("/api/").then(|| url.to_string()))
+}
+
+/// Seconds a response cached at `epoch_ms` may live: until the next sync tick
+/// plus SYNC_SETTLE_SECS, by which time that sync has landed. A response
+/// cached while a sync may still be running expires as soon as it settles.
+fn cache_ttl_secs(epoch_ms: f64) -> i64 {
+    let now = (epoch_ms / 1000.0) as i64;
+    SYNC_INTERVAL_SECS - (now - SYNC_SETTLE_SECS).rem_euclid(SYNC_INTERVAL_SECS)
+}
+
+async fn route(req: Request, env: Env) -> Result<Response> {
     Router::new()
         .get_async("/api/:resource/:id", |_, ctx| async move { get_by_id(ctx).await })
         .get_async("/api/:resource", |req, ctx| async move { query_resource(req, ctx).await })
@@ -345,11 +401,23 @@ fn push_bind(binds: &mut Vec<Bind>, bind: Bind) -> usize {
     binds.len()
 }
 
+/// The JSON path for `field` as a SQL string literal, e.g. `'$.asn'`.
+///
+/// Paths are written into the SQL rather than bound because SQLite only uses
+/// an expression index (migrations/0003-0004) when the query spells out the very
+/// same expression; a bound `?N` path never matches one. This is safe only
+/// because `field` passed `is_filterable_field` (`[a-z][a-z0-9_]*`), so it
+/// cannot close the quote. Values stay bound parameters.
+fn json_path_literal(field: &str) -> String {
+    assert!(is_filterable_field(field), "unvalidated field in SQL: {:?}", field);
+    format!("'$.{}'", field)
+}
+
 /// Append the SQL for one field filter. Fields compare in their text form so a
 /// JSON integer (asn 44324) matches its decimal string; absent or null fields
-/// extract to NULL, which no comparison matches, so the row drops. Paths and
-/// values are bound parameters — no SQL/JSON injection — and each placeholder
-/// is used once.
+/// extract to NULL, which no comparison matches, so the row drops. Values are
+/// bound parameters, each placeholder used once; the path is a validated
+/// literal (see `json_path_literal`).
 fn push_field_filter(
     sql: &mut String,
     binds: &mut Vec<Bind>,
@@ -357,36 +425,48 @@ fn push_field_filter(
     op: FilterOp,
     value: &str,
 ) {
-    let path = || Bind::Text(format!("$.{}", field));
+    let p = json_path_literal(field);
     match op {
         FilterOp::Eq => {
             // Upstream matches text case-insensitively and accepts true/True/1
             // for booleans. json_extract turns JSON booleans into 1/0, so also
-            // compare json_type against the value's boolean reading ('' when
-            // it has none, which no json_type equals).
+            // compare json_type against the value's boolean reading. Values
+            // with no boolean reading (asn=13335) skip that branch: it could
+            // never match, and the bare comparison is what the
+            // migrations/0003-0004 indexes serve.
             let as_bool = match value.to_ascii_lowercase().as_str() {
-                "1" | "true" => "true",
-                "0" | "false" => "false",
-                _ => "",
+                "1" | "true" => Some("true"),
+                "0" | "false" => Some("false"),
+                _ => None,
             };
-            let p1 = push_bind(binds, path());
-            let b = push_bind(binds, Bind::Text(as_bool.to_string()));
-            let p2 = push_bind(binds, path());
-            let v = push_bind(binds, Bind::Text(value.to_string()));
-            sql.push_str(&format!(
-                " AND (json_type(payload, ?{}) = ?{} \
-                 OR CAST(json_extract(payload, ?{}) AS TEXT) = ?{} COLLATE NOCASE)",
-                p1, b, p2, v
-            ));
+            match as_bool {
+                Some(as_bool) => {
+                    let b = push_bind(binds, Bind::Text(as_bool.to_string()));
+                    let v = push_bind(binds, Bind::Text(value.to_string()));
+                    sql.push_str(&format!(
+                        " AND (json_type(payload, {p}) = ?{} \
+                         OR CAST(json_extract(payload, {p}) AS TEXT) = ?{} COLLATE NOCASE)",
+                        b,
+                        v,
+                        p = p
+                    ));
+                }
+                None => {
+                    let v = push_bind(binds, Bind::Text(value.to_string()));
+                    sql.push_str(&format!(
+                        " AND CAST(json_extract(payload, {}) AS TEXT) = ?{} COLLATE NOCASE",
+                        p, v
+                    ));
+                }
+            }
         }
         FilterOp::In => {
-            let p = push_bind(binds, path());
             let placeholders: Vec<String> = value
                 .split(',')
                 .map(|v| format!("?{}", push_bind(binds, Bind::Text(v.trim().to_string()))))
                 .collect();
             sql.push_str(&format!(
-                " AND CAST(json_extract(payload, ?{}) AS TEXT) COLLATE NOCASE IN ({})",
+                " AND CAST(json_extract(payload, {}) AS TEXT) COLLATE NOCASE IN ({})",
                 p,
                 placeholders.join(", ")
             ));
@@ -398,17 +478,16 @@ fn push_field_filter(
                 FilterOp::Gt => ">",
                 _ => ">=",
             };
-            let p = push_bind(binds, path());
             // Numbers compare numerically; anything else (e.g. ISO dates) as text.
             match value.parse::<f64>().ok().filter(|n| n.is_finite()) {
                 Some(n) => {
                     let v = push_bind(binds, Bind::Num(n));
-                    sql.push_str(&format!(" AND json_extract(payload, ?{}) {} ?{}", p, cmp, v));
+                    sql.push_str(&format!(" AND json_extract(payload, {}) {} ?{}", p, cmp, v));
                 }
                 None => {
                     let v = push_bind(binds, Bind::Text(value.to_string()));
                     sql.push_str(&format!(
-                        " AND CAST(json_extract(payload, ?{}) AS TEXT) {} ?{}",
+                        " AND CAST(json_extract(payload, {}) AS TEXT) {} ?{}",
                         p, cmp, v
                     ));
                 }
@@ -418,10 +497,9 @@ fn push_field_filter(
             // Both are case-insensitive upstream. instr() sidesteps LIKE's
             // wildcard escaping; a first match at position 1 means "starts with".
             let test = if op == FilterOp::Contains { "> 0" } else { "= 1" };
-            let p = push_bind(binds, path());
             let v = push_bind(binds, Bind::Text(value.to_string()));
             sql.push_str(&format!(
-                " AND instr(lower(CAST(json_extract(payload, ?{}) AS TEXT)), lower(?{})) {}",
+                " AND instr(lower(CAST(json_extract(payload, {}) AS TEXT)), lower(?{})) {}",
                 p, v, test
             ));
         }
@@ -481,8 +559,18 @@ fn build_query_plan(
         }
     }
 
-    let mut sql = String::from("SELECT payload FROM objects WHERE resource = ?1");
-    let mut binds: Vec<Bind> = vec![Bind::Text(resource.to_string())];
+    // The resource is a literal too, so the per-resource partial indexes
+    // (`WHERE resource = 'net'`) apply. Only a RESOURCES member gets here.
+    let resource = RESOURCES
+        .iter()
+        .copied()
+        .find(|r| *r == resource)
+        .ok_or(ApiError {
+            status: 400,
+            message: "unknown resource",
+        })?;
+    let mut sql = format!("SELECT payload FROM objects WHERE resource = '{}'", resource);
+    let mut binds: Vec<Bind> = Vec::new();
 
     if let Some(id) = id_filter {
         let idx = push_bind(&mut binds, Bind::Num(id as f64));
@@ -739,9 +827,12 @@ async fn reconcile_resource(env: &Env, resource: &str, dry_run: bool) -> Result<
     let cutoff = iso_timestamp(listing.meta.generated.map_or(started, |secs| secs * 1000.0));
     let upstream: HashSet<i64> = listing.data.iter().map(|o| o.id).collect();
 
-    let live: Vec<i64> = db
+    // No ORDER BY: it can push SQLite onto a primary-key walk or a temp
+    // sort. The ids are sorted here instead, which keeps the order in which
+    // reconcile_candidates picks (and defers) candidates.
+    let mut live: Vec<i64> = db
         .prepare(&format!(
-            "SELECT obj_id FROM objects WHERE resource = ?1 AND updated < ?2 AND {} ORDER BY obj_id",
+            "SELECT obj_id FROM objects WHERE resource = ?1 AND updated < ?2 AND {}",
             NOT_DELETED
         ))
         .bind(&[JsValue::from_str(resource), JsValue::from_str(&cutoff)])?
@@ -751,6 +842,7 @@ async fn reconcile_resource(env: &Env, resource: &str, dry_run: bool) -> Result<
         .into_iter()
         .map(|row| row.obj_id)
         .collect();
+    live.sort_unstable();
     let (candidates, deferred) = reconcile_candidates(&live, &upstream)?;
 
     // Look everything up before writing anything, so the writes below land
@@ -1102,6 +1194,30 @@ mod tests {
     }
 
     #[test]
+    fn cache_expires_once_the_next_sync_has_settled() {
+        const TICK: f64 = 1_792_627_200_000.0; // 2026-10-22T00:00:00Z, a sync tick
+        let at = |secs: i64| TICK + (secs * 1000) as f64;
+        // Just before a tick: live until that tick's sync settles (00:10).
+        assert_eq!(cache_ttl_secs(at(-1)), 601);
+        // During the settle window the sync may be mid-flight: expire at 00:10.
+        assert_eq!(cache_ttl_secs(at(0)), 600);
+        assert_eq!(cache_ttl_secs(at(300)), 300);
+        assert_eq!(cache_ttl_secs(at(599)), 1);
+        // Once settled: live until the next tick's sync settles (03:10).
+        assert_eq!(cache_ttl_secs(at(600)), 3 * 3600);
+        assert_eq!(cache_ttl_secs(at(601)), 3 * 3600 - 1);
+        assert_eq!(cache_ttl_secs(at(3 * 3600 - 60)), 660);
+    }
+
+    #[test]
+    fn cache_ttl_is_always_positive_and_bounded() {
+        for secs in (0..2 * 3 * 3600).step_by(37) {
+            let ttl = cache_ttl_secs(1_792_627_200_000.0 + (secs * 1000) as f64);
+            assert!((1..=3 * 3600).contains(&ttl), "ttl {} at +{}s", ttl, secs);
+        }
+    }
+
+    #[test]
     fn reconcile_candidates_are_live_rows_upstream_no_longer_lists() {
         let upstream: HashSet<i64> = [1, 2, 4, 9].into_iter().collect();
         let (missing, deferred) = reconcile_candidates(&[1, 2, 3, 4, 5], &upstream).expect("small gap");
@@ -1162,48 +1278,75 @@ mod tests {
         let plan = plan_for("net", &[]);
         assert_eq!(
             plan.sql,
-            "SELECT payload FROM objects WHERE resource = ?1 \
+            "SELECT payload FROM objects WHERE resource = 'net' \
              AND json_extract(payload, '$.status') IS NOT 'deleted' \
-             ORDER BY obj_id LIMIT ?2"
+             ORDER BY obj_id LIMIT ?1"
         );
-        assert_eq!(plan.binds, vec![Bind::Text("net".into()), Bind::Num(CAP)]);
+        assert_eq!(plan.binds, vec![Bind::Num(CAP)]);
         assert!(!plan.by_id);
     }
 
     #[test]
     fn plan_filters_by_arbitrary_field() {
         // The bug fix: ?asn=44324 must actually filter, not return page 1.
+        // Resource and path are literals and a non-boolean value gets no
+        // json_type branch, so the migrations/0003-0004 index can serve it.
         let plan = plan_for("net", &[("asn", "44324")]);
         assert_eq!(
             plan.sql,
-            "SELECT payload FROM objects WHERE resource = ?1 \
+            "SELECT payload FROM objects WHERE resource = 'net' \
              AND json_extract(payload, '$.status') IS NOT 'deleted' \
-             AND (json_type(payload, ?2) = ?3 \
-             OR CAST(json_extract(payload, ?4) AS TEXT) = ?5 COLLATE NOCASE) \
-             ORDER BY obj_id LIMIT ?6"
+             AND CAST(json_extract(payload, '$.asn') AS TEXT) = ?1 COLLATE NOCASE \
+             ORDER BY obj_id LIMIT ?2"
         );
-        assert_eq!(
-            plan.binds,
-            vec![
-                Bind::Text("net".into()),
-                Bind::Text("$.asn".into()),
-                Bind::Text("".into()),
-                Bind::Text("$.asn".into()),
-                Bind::Text("44324".into()),
-                Bind::Num(CAP),
-            ]
-        );
+        assert_eq!(plan.binds, vec![Bind::Text("44324".into()), Bind::Num(CAP)]);
+    }
+
+    #[test]
+    fn plan_matches_the_filter_index_expression_exactly() {
+        // migrations/0003_net_asn_index.sql and 0004_netixlan_asn_index.sql
+        // index this exact text; if the two drift apart SQLite silently
+        // falls back to a full scan.
+        let index_expr = "CAST(json_extract(payload, '$.asn') AS TEXT)";
+        for resource in ["net", "netixlan"] {
+            let plan = plan_for(resource, &[("asn", "13335")]);
+            assert!(plan.sql.contains(&format!("resource = '{}'", resource)));
+            assert!(plan.sql.contains(&format!("{} = ?1 COLLATE NOCASE", index_expr)));
+            assert!(!plan.sql.contains("json_type"));
+        }
+    }
+
+    #[test]
+    fn plan_rejects_a_resource_outside_the_allowlist() {
+        // The resource is written into the SQL, so only RESOURCES may get there.
+        for resource in ["bogus", "net' OR '1'='1", ""] {
+            assert_eq!(
+                build_query_plan(resource, &[]).err(),
+                Some(ApiError { status: 400, message: "unknown resource" })
+            );
+        }
     }
 
     #[test]
     fn plan_reads_boolean_filter_values() {
         // Upstream accepts 1/true/True (and 0/false) for boolean fields.
-        for (value, as_bool) in [("1", "true"), ("True", "true"), ("false", "false"), ("x", "")] {
+        for (value, as_bool) in [("1", "true"), ("True", "true"), ("false", "false"), ("0", "false")] {
             let plan = plan_for("net", &[("info_never_via_route_servers", value)]);
-            assert_eq!(plan.binds[1], Bind::Text("$.info_never_via_route_servers".into()));
-            assert_eq!(plan.binds[2], Bind::Text(as_bool.into()));
-            assert_eq!(plan.binds[4], Bind::Text(value.into()));
+            assert_eq!(
+                plan.sql,
+                "SELECT payload FROM objects WHERE resource = 'net' \
+                 AND json_extract(payload, '$.status') IS NOT 'deleted' \
+                 AND (json_type(payload, '$.info_never_via_route_servers') = ?1 \
+                 OR CAST(json_extract(payload, '$.info_never_via_route_servers') AS TEXT) = ?2 COLLATE NOCASE) \
+                 ORDER BY obj_id LIMIT ?3"
+            );
+            assert_eq!(plan.binds[0], Bind::Text(as_bool.into()));
+            assert_eq!(plan.binds[1], Bind::Text(value.into()));
         }
+        // No boolean reading: plain comparison only.
+        let plan = plan_for("net", &[("info_never_via_route_servers", "x")]);
+        assert!(!plan.sql.contains("json_type"));
+        assert_eq!(plan.binds[0], Bind::Text("x".into()));
     }
 
     #[test]
@@ -1211,17 +1354,14 @@ mod tests {
         let plan = plan_for("netixlan", &[("asn", "44324"), ("ix_id", "26")]);
         assert_eq!(
             plan.sql,
-            "SELECT payload FROM objects WHERE resource = ?1 \
+            "SELECT payload FROM objects WHERE resource = 'netixlan' \
              AND json_extract(payload, '$.status') IS NOT 'deleted' \
-             AND (json_type(payload, ?2) = ?3 \
-             OR CAST(json_extract(payload, ?4) AS TEXT) = ?5 COLLATE NOCASE) \
-             AND (json_type(payload, ?6) = ?7 \
-             OR CAST(json_extract(payload, ?8) AS TEXT) = ?9 COLLATE NOCASE) \
-             ORDER BY obj_id LIMIT ?10"
+             AND CAST(json_extract(payload, '$.asn') AS TEXT) = ?1 COLLATE NOCASE \
+             AND CAST(json_extract(payload, '$.ix_id') AS TEXT) = ?2 COLLATE NOCASE \
+             ORDER BY obj_id LIMIT ?3"
         );
-        assert_eq!(plan.binds[4], Bind::Text("44324".into()));
-        assert_eq!(plan.binds[5], Bind::Text("$.ix_id".into()));
-        assert_eq!(plan.binds[8], Bind::Text("26".into()));
+        assert_eq!(plan.binds[0], Bind::Text("44324".into()));
+        assert_eq!(plan.binds[1], Bind::Text("26".into()));
     }
 
     #[test]
@@ -1229,11 +1369,11 @@ mod tests {
         let plan = plan_for("net", &[("id", "34997")]);
         assert_eq!(
             plan.sql,
-            "SELECT payload FROM objects WHERE resource = ?1 AND obj_id = ?2 \
+            "SELECT payload FROM objects WHERE resource = 'net' AND obj_id = ?1 \
              AND json_extract(payload, '$.status') IS NOT 'deleted' \
-             ORDER BY obj_id LIMIT ?3"
+             ORDER BY obj_id LIMIT ?2"
         );
-        assert_eq!(plan.binds[1], Bind::Num(34997.0));
+        assert_eq!(plan.binds[0], Bind::Num(34997.0));
         assert!(plan.by_id);
     }
 
@@ -1242,7 +1382,7 @@ mod tests {
         // Only the exact `id` key gets upstream's 404-when-empty treatment.
         let plan = plan_for("net", &[("id__in", "1,2")]);
         assert!(!plan.by_id);
-        assert_eq!(plan.binds[1], Bind::Text("$.id".into()));
+        assert!(plan.sql.contains("CAST(json_extract(payload, '$.id') AS TEXT) COLLATE NOCASE IN (?1, ?2)"));
     }
 
     #[test]
@@ -1251,9 +1391,9 @@ mod tests {
         let plan = plan_for("netixlan", &[("since", "1700000000")]);
         assert_eq!(
             plan.sql,
-            "SELECT payload FROM objects WHERE resource = ?1 \
-             AND datetime(updated) > datetime(?2, 'unixepoch') \
-             ORDER BY obj_id LIMIT ?3"
+            "SELECT payload FROM objects WHERE resource = 'netixlan' \
+             AND datetime(updated) > datetime(?1, 'unixepoch') \
+             ORDER BY obj_id LIMIT ?2"
         );
     }
 
@@ -1263,8 +1403,8 @@ mod tests {
         // clauses apply, so the mirror does too.
         let plan = plan_for("netixlan", &[("status", "deleted")]);
         assert!(plan.sql.contains(NOT_DELETED));
-        assert_eq!(plan.binds[1], Bind::Text("$.status".into()));
-        assert_eq!(plan.binds[4], Bind::Text("deleted".into()));
+        assert!(plan.sql.contains("CAST(json_extract(payload, '$.status') AS TEXT) = ?1 COLLATE NOCASE"));
+        assert_eq!(plan.binds[0], Bind::Text("deleted".into()));
     }
 
     #[test]
@@ -1277,9 +1417,9 @@ mod tests {
         );
         assert_eq!(
             plan.sql,
-            "SELECT payload FROM objects WHERE resource = ?1 \
+            "SELECT payload FROM objects WHERE resource = 'net' \
              AND json_extract(payload, '$.status') IS NOT 'deleted' \
-             ORDER BY obj_id LIMIT ?2"
+             ORDER BY obj_id LIMIT ?1"
         );
     }
 
@@ -1289,9 +1429,9 @@ mod tests {
         let plan = plan_for("net", &[("ASN", "1"), ("a-b", "2")]);
         assert_eq!(
             plan.sql,
-            "SELECT payload FROM objects WHERE resource = ?1 \
+            "SELECT payload FROM objects WHERE resource = 'net' \
              AND json_extract(payload, '$.status') IS NOT 'deleted' \
-             ORDER BY obj_id LIMIT ?2"
+             ORDER BY obj_id LIMIT ?1"
         );
     }
 
@@ -1300,35 +1440,35 @@ mod tests {
         let plan = plan_for("net", &[("limit", "5"), ("skip", "10")]);
         assert_eq!(
             plan.sql,
-            "SELECT payload FROM objects WHERE resource = ?1 \
+            "SELECT payload FROM objects WHERE resource = 'net' \
              AND json_extract(payload, '$.status') IS NOT 'deleted' \
-             ORDER BY obj_id LIMIT ?2 OFFSET ?3"
+             ORDER BY obj_id LIMIT ?1 OFFSET ?2"
         );
-        assert_eq!(plan.binds[1], Bind::Num(5.0));
-        assert_eq!(plan.binds[2], Bind::Num(10.0));
+        assert_eq!(plan.binds[0], Bind::Num(5.0));
+        assert_eq!(plan.binds[1], Bind::Num(10.0));
     }
 
     #[test]
     fn plan_limit_zero_means_no_client_limit() {
         // Upstream's "no limit"; the mirror still stops one past its cap.
         let plan = plan_for("net", &[("limit", "0")]);
-        assert!(plan.sql.ends_with("ORDER BY obj_id LIMIT ?2"));
-        assert_eq!(plan.binds[1], Bind::Num(CAP));
+        assert!(plan.sql.ends_with("ORDER BY obj_id LIMIT ?1"));
+        assert_eq!(plan.binds[0], Bind::Num(CAP));
     }
 
     #[test]
     fn plan_clamps_limits_above_the_cap() {
         // limit=100000 on a big table must be refused, not loaded in full.
         let plan = plan_for("netixlan", &[("limit", "100000")]);
-        assert_eq!(plan.binds[1], Bind::Num(CAP));
+        assert_eq!(plan.binds[0], Bind::Num(CAP));
     }
 
     #[test]
     fn plan_skip_without_limit_pages_from_offset() {
         let plan = plan_for("net", &[("skip", "10")]);
-        assert!(plan.sql.ends_with("ORDER BY obj_id LIMIT ?2 OFFSET ?3"));
-        assert_eq!(plan.binds[1], Bind::Num(CAP));
-        assert_eq!(plan.binds[2], Bind::Num(10.0));
+        assert!(plan.sql.ends_with("ORDER BY obj_id LIMIT ?1 OFFSET ?2"));
+        assert_eq!(plan.binds[0], Bind::Num(CAP));
+        assert_eq!(plan.binds[1], Bind::Num(10.0));
     }
 
     #[test]
@@ -1360,22 +1500,21 @@ mod tests {
     fn plan_in_operator_matches_any_listed_value() {
         let plan = plan_for("net", &[("asn__in", "6939, 44324")]);
         assert!(plan.sql.contains(
-            "AND CAST(json_extract(payload, ?2) AS TEXT) COLLATE NOCASE IN (?3, ?4)"
+            "AND CAST(json_extract(payload, '$.asn') AS TEXT) COLLATE NOCASE IN (?1, ?2)"
         ));
-        assert_eq!(plan.binds[1], Bind::Text("$.asn".into()));
-        assert_eq!(plan.binds[2], Bind::Text("6939".into()));
-        assert_eq!(plan.binds[3], Bind::Text("44324".into()));
+        assert_eq!(plan.binds[0], Bind::Text("6939".into()));
+        assert_eq!(plan.binds[1], Bind::Text("44324".into()));
     }
 
     #[test]
     fn plan_range_operators_compare_numbers_numerically() {
         let plan = plan_for("net", &[("asn__lt", "4"), ("updated__gte", "2026-01-01")]);
-        assert!(plan.sql.contains("AND json_extract(payload, ?2) < ?3"));
+        assert!(plan.sql.contains("AND json_extract(payload, '$.asn') < ?1"));
         assert!(plan
             .sql
-            .contains("AND CAST(json_extract(payload, ?4) AS TEXT) >= ?5"));
-        assert_eq!(plan.binds[2], Bind::Num(4.0));
-        assert_eq!(plan.binds[4], Bind::Text("2026-01-01".into()));
+            .contains("AND CAST(json_extract(payload, '$.updated') AS TEXT) >= ?2"));
+        assert_eq!(plan.binds[0], Bind::Num(4.0));
+        assert_eq!(plan.binds[1], Bind::Text("2026-01-01".into()));
     }
 
     #[test]
@@ -1385,12 +1524,12 @@ mod tests {
             &[("name__contains", "Hurricane"), ("name__startswith", "hurr")],
         );
         assert!(plan.sql.contains(
-            "AND instr(lower(CAST(json_extract(payload, ?2) AS TEXT)), lower(?3)) > 0"
+            "AND instr(lower(CAST(json_extract(payload, '$.name') AS TEXT)), lower(?1)) > 0"
         ));
         assert!(plan.sql.contains(
-            "AND instr(lower(CAST(json_extract(payload, ?4) AS TEXT)), lower(?5)) = 1"
+            "AND instr(lower(CAST(json_extract(payload, '$.name') AS TEXT)), lower(?2)) = 1"
         ));
-        assert_eq!(plan.binds[1], Bind::Text("$.name".into()));
+        assert_eq!(plan.binds[0], Bind::Text("Hurricane".into()));
     }
 
     #[test]
@@ -1398,6 +1537,6 @@ mod tests {
         // asn__bogus builds a $.asn__bogus path that no payload has -> empty
         // result, the safe failure mode (never a misleading full page).
         let plan = plan_for("net", &[("asn__bogus", "1")]);
-        assert_eq!(plan.binds[1], Bind::Text("$.asn__bogus".into()));
+        assert!(plan.sql.contains("json_extract(payload, '$.asn__bogus')"));
     }
 }
