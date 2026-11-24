@@ -40,6 +40,11 @@ database_id = "${D1_DATABASE_ID}"
 EOF
 echo "Generated wrangler.toml"
 
+# --- Install the pinned Wrangler (package.json) ------------------------------
+# workers-rs 0.9 emits Wasm `import source`, which older Wrangler/esbuild
+# cannot bundle; the deploy step's `npx wrangler deploy` picks this one up.
+npm ci --no-fund --no-audit
+
 # --- Install the Rust toolchain (absent from the build image) ---------------
 if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
@@ -49,5 +54,5 @@ fi
 rustup target add wasm32-unknown-unknown
 
 # --- Build the Worker -------------------------------------------------------
-cargo install -q worker-build --version 0.7.2 --locked
+cargo install -q worker-build --version 0.9.0 --locked
 worker-build --release

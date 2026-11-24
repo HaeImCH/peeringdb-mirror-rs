@@ -17,7 +17,7 @@ Rust Cloudflare Worker that mirrors the public PeeringDB API using a D1 database
 - Supported resources: `org`, `campus`, `fac`, `net`, `ix`, `carrier`, `carrierfac`, `ixfac`, `ixlan`, `ixpfx`, `netfac`, `netixlan`.
 
 ## Quick start
-1) Install tools: `npm i -g wrangler` (build uses `worker-build 0.7.x`, installed automatically during `wrangler` build).
+1) Install tools: `npm install` (pins Wrangler in `package.json`; use `npx wrangler …` for every command below, because an older global Wrangler can't bundle workers-rs 0.9's Wasm `import source`). The build installs `worker-build 0.9.x` into the project-local `.tools/` automatically.
 2) Copy the example config:
    ```bash
    cp wrangler.toml.example wrangler.toml
@@ -141,7 +141,7 @@ After import, the scheduled cron will keep data up to date via incremental syncs
 - Single-object responses don't include the nested `*_set` lists (e.g. `netixlan_set` on `/api/net/:id`) that the official API adds, and `depth`/`fields` are ignored.
 - List responses are capped at 5,000 objects (`MAX_RESPONSE_ROWS`); this is where the official API differs. Larger results, such as all of `/api/net`, would exceed the Worker's memory/CPU limits (Cloudflare error 1102), so they get a 400 instead of being truncated. Page with `limit`/`skip`, or use the `public.peeringdb.com` snapshots for full dumps.
 - If you see `no such table: objects` or `no such table: sync_state`, run the migration step above to create the schema in your D1 database.
-- Build targets `workers-rs 0.7.x` and uses upstream `worker-build`/`wasm-bindgen 0.2.106` (no local patches).
+- Build targets `workers-rs 0.9.x` and uses upstream `worker-build`/`wasm-bindgen 0.2.130` (no local patches).
 
 ## Project layout
 - `src/lib.rs` – Worker entrypoint, routes, sync logic, D1 queries.

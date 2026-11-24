@@ -34,3 +34,6 @@ __pycache__/
 
 # Golden-response snapshots (scripts/golden.sh)
 tasks/golden/
+
+# Project-local worker-build install (wrangler.toml [build])
+.tools/

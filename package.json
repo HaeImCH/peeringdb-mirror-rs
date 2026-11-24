@@ -1,0 +1,8 @@
+{
+  "name": "peeringdb-mirror",
+  "private": true,
+  "description": "Pins the Wrangler used locally (npx wrangler) and by Workers Builds; workers-rs 0.9 output needs an esbuild that bundles Wasm `import source`.",
+  "devDependencies": {
+    "wrangler": "4.167.0"
+  }
+}
