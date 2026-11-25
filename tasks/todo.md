@@ -117,11 +117,11 @@ Spec: `SPEC.md` · Plan: `tasks/plan.md` · Branch: `perf/d1-row-reads`
 **Why two days:** D1 counts every index entry as a written row. Building `idx_netixlan_asn` writes about 62k rows and `idx_net_asn` about 34k. Together, plus the day's sync and reconcile writes, that is too close to 100k. If the write limit trips partway, syncs fail until the next reset.
 
 **Steps:**
-1. **Day 1, pre-check:** run `wrangler d1 migrations list peeringdb-mirror --remote`. Only `0003` and `0004` should be pending. If `0002` shows up, stop: its `MAX(updated) … GROUP BY` reads the whole table.
-2. **Day 1:** run `wrangler d1 execute peeringdb-mirror --remote --file migrations/0003_net_asn_index.sql`. This builds `idx_net_asn` (about 34k writes, about 34k reads).
-3. **Day 1:** run `wrangler d1 execute peeringdb-mirror --remote --command "EXPLAIN QUERY PLAN <net asn SQL from scripts/check_query_plans.sh>"`. Confirm `USING INDEX idx_net_asn` on the real D1 engine, not just the local sqlite3.
+1. **Day 1, pre-check (done 2026-11-25; only 0003 and 0004 were pending):** run `wrangler d1 migrations list peeringdb-mirror --remote`. Only `0003` and `0004` should be pending. If `0002` shows up, stop: its `MAX(updated) … GROUP BY` reads the whole table.
+2. **Day 1:** run `wrangler d1 execute peeringdb-mirror --remote --file migrations/0003_net_asn_index.sql`. This builds `idx_net_asn`. *Done 2026-11-25. Measured: 272,200 rows read (a partial index build still scans the whole table) and 36,980 written. On the remote, `net?asn=13335` now reads 2 rows instead of ~37k.*
+3. **Day 1 (done; plan shows `SEARCH objects USING INDEX idx_net_asn (<expr>=?)`):** run `wrangler d1 execute peeringdb-mirror --remote --command "EXPLAIN QUERY PLAN <net asn SQL from scripts/check_query_plans.sh>"`. Confirm `USING INDEX idx_net_asn` on the real D1 engine, not just the local sqlite3.
 4. **Day 1:** push the branch and merge to `main`, which deploys through Workers Builds. The cache and the new SQL go live, and `net?asn` is indexed from then on.
-5. **Day 2 (after 00:00 UTC):** `wrangler d1 execute ... --file migrations/0004_netixlan_asn_index.sql`, then run the same EXPLAIN check for `netixlan`.
+5. **Day 2 (after 00:00 UTC):** `wrangler d1 execute ... --file migrations/0004_netixlan_asn_index.sql`. Expect about 272k reads and about 63k writes. Then run the same EXPLAIN check for `netixlan`.
 6. **Day 2:** run `wrangler d1 migrations apply peeringdb-mirror --remote`. This records `0003` and `0004` as applied; both are `IF NOT EXISTS`, so nothing is rebuilt.
 
 **Acceptance criteria:**
