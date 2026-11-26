@@ -121,13 +121,13 @@ Spec: `SPEC.md` · Plan: `tasks/plan.md` · Branch: `perf/d1-row-reads`
 2. **Day 1:** run `wrangler d1 execute peeringdb-mirror --remote --file migrations/0003_net_asn_index.sql`. This builds `idx_net_asn`. *Done 2026-11-25. Measured: 272,200 rows read (a partial index build still scans the whole table) and 36,980 written. On the remote, `net?asn=13335` now reads 2 rows instead of ~37k.*
 3. **Day 1 (done; plan shows `SEARCH objects USING INDEX idx_net_asn (<expr>=?)`):** run `wrangler d1 execute peeringdb-mirror --remote --command "EXPLAIN QUERY PLAN <net asn SQL from scripts/check_query_plans.sh>"`. Confirm `USING INDEX idx_net_asn` on the real D1 engine, not just the local sqlite3.
 4. **Day 1:** push the branch and merge to `main`, which deploys through Workers Builds. The cache and the new SQL go live, and `net?asn` is indexed from then on.
-5. **Day 2 (after 00:00 UTC):** `wrangler d1 execute ... --file migrations/0004_netixlan_asn_index.sql`. Expect about 272k reads and about 63k writes. Then run the same EXPLAIN check for `netixlan`.
-6. **Day 2:** run `wrangler d1 migrations apply peeringdb-mirror --remote`. This records `0003` and `0004` as applied; both are `IF NOT EXISTS`, so nothing is rebuilt.
+5. **Day 2 (after 00:00 UTC):** `wrangler d1 execute ... --file migrations/0004_netixlan_asn_index.sql`. Expect about 272k reads and about 63k writes. Then run the same EXPLAIN check for `netixlan`. *Done 2026-11-26. Measured: 309,152 rows read and 73,488 written. The plan shows `SEARCH objects USING INDEX idx_netixlan_asn (<expr>=?)`, and `netixlan?asn=13335` reads 436 rows for 418 returned (was ~62k).*
+6. **Day 2:** run `wrangler d1 migrations apply peeringdb-mirror --remote`. This records `0003` and `0004` as applied; both are `IF NOT EXISTS`, so nothing is rebuilt. *Done 2026-11-26; `migrations list` reports nothing pending.*
 
 **Acceptance criteria:**
-- [ ] Both indexes exist remotely, and EXPLAIN on remote D1 shows each one being used
+- [x] Both indexes exist remotely, and EXPLAIN on remote D1 shows each one being used
 - [ ] After one full pathvector cycle, D1 query insights show rows read per row returned ≤ 3 for the `asn` filters and cache hits for repeat runs
-- [ ] After 24h, daily rows read is under 1M and daily rows written is well under 100k
+- [ ] After 24h, daily rows read is under 1M and daily rows written is well under 100k *(first 24h after the deploy, 2026-11-26 12:13 UTC: 235,805 read and 1,736 written, with only `net.asn` indexed. Re-check after 2026-11-27 12:00 UTC.)*
 
 **Verification:**
 - [ ] Manual: D1 dashboard (row metrics, query insights) and Workers Logs
