@@ -126,11 +126,11 @@ Spec: `SPEC.md` · Plan: `tasks/plan.md` · Branch: `perf/d1-row-reads`
 
 **Acceptance criteria:**
 - [x] Both indexes exist remotely, and EXPLAIN on remote D1 shows each one being used
-- [ ] After one full pathvector cycle, D1 query insights show rows read per row returned ≤ 3 for the `asn` filters and cache hits for repeat runs
-- [ ] After 24h, daily rows read is under 1M and daily rows written is well under 100k *(first 24h after the deploy, 2026-11-26 12:13 UTC: 235,805 read and 1,736 written, with only `net.asn` indexed. Re-check after 2026-11-27 12:00 UTC.)*
+- [x] After one full pathvector cycle, D1 query insights show rows read per row returned ≤ 3 for the `asn` filters and cache hits for repeat runs *(`wrangler d1 insights`, 1d to 2026-11-27 13:07 UTC: the `net` asn query ran 13 times at 2 rows read each, down from 156 runs at ~37k each. No `netixlan` asn query reached D1 in that window. The top reader is now the reconcile scan: 25,642 rows over 9 runs.)*
+- [x] After 24h, daily rows read is under 1M and daily rows written is well under 100k *(first 24h after the deploy, 2026-11-26 12:13 UTC: 235,805 read and 1,736 written, with only `net.asn` indexed. With both indexes, 24h to 2026-11-27 13:07 UTC: 235,617 read and 1,103 written.)*
 
 **Verification:**
-- [ ] Manual: D1 dashboard (row metrics, query insights) and Workers Logs
+- [x] Manual: D1 row metrics and query insights (via `wrangler d1 info` / `wrangler d1 insights`)
 
 **Dependencies:** Checkpoint B
 **Files:** none (operational)
